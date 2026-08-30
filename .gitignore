@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Cookies & logs (민감/생성 파일)
+cookies.txt
+*.cookies.txt
+*_cookies.txt
+cookies.txt.tmp
+download.log
+FAIL_LIST_*.txt
+*.log
+
+# Downloads (로컬 다운로드 폴더)
+Downloads/
+downloads/
+
+# yt-dlp binaries
+yt-dlp.exe
+ffmpeg.exe
+ffprobe.exe
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp
+*.tmp
+*.bak
