@@ -31,7 +31,7 @@ from yt_dlp import YoutubeDL  # pip install yt-dlp
 
 from subtitle_db import (
     db_init, db_record_start, db_record_finish,
-    db_latest_failed, db_count_by_status,
+    db_latest_failed, db_count_by_status, db_last_success,
 )
 
 # =============== 환경 설정 ===============
@@ -46,6 +46,7 @@ DB_PATH = os.path.join(DOWNLOAD_DIR, "subtitle_jobs.db")
 SUCCESS_LIST = []  # 다운로드 시도된 영상 제목
 SKIPPED_LIST = []  # 조건에 안 맞아 건너뛴 영상: dict {title, reason}
 FAIL_LIST = []     # 실패: dict {title, url}
+CACHED_LIST = []   # 이미 받아둠 (DB 완료 기록 + 파일 존재 → 재요청 안 함)
 
 # --- 차단 방지 튜닝 값 (자막은 가벼우니 미디어 모드보다 짧게) ---
 SLEEP_BETWEEN_VIDEOS_MIN = 2.0
@@ -278,6 +279,7 @@ def make_sub_ydl(outtmpl: str, langs, auto_subs: bool, sub_format: str, match_fi
         "subtitleslangs": langs,        # 예: ['ko', 'en'] 또는 ['all']
         "subtitlesformat": sub_format,  # 예: 'vtt/best', 'srt/vtt/best'
         "outtmpl": outtmpl,
+        "nooverwrites": True,  # P1-1: 같은 파일이 이미 있으면 덮어쓰지 않고 건너뜀
         "retries": 10,
         "fragment_retries": 3,
         "concurrent_fragments": 1,
@@ -470,10 +472,30 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
 
     DB에 시도 시작/종료(시각·제목·URL·결과)를 기록하고, 성공 시 자막 파일
     상단에 완료시각·제목·URL 헤더를 기입합니다.
-    반환: (result, saw_429) — result는 downloaded / skipped / failed.
+    반환: (result, saw_429) — result는 downloaded / skipped / failed / cached.
+    cached는 DB에 같은 언어 완료 기록이 있고 파일도 그대로 있을 때
+    (유튜브에 요청을 1번도 보내지 않음).
     """
     outtmpl = build_sub_outtmpl(mode if mode in ("playlist", "channel", "single") else "single")
     started_title = title_hint or url
+    langs_str = ",".join(langs) if isinstance(langs, (list, tuple)) else str(langs)
+
+    # P1-1: 이미 받은 자막이면 요청 자체를 생략 (DB 완료 기록 + 파일 존재 확인)
+    if db_conn is not None:
+        try:
+            prev = db_last_success(db_conn, url, langs_str)
+        except Exception as e:
+            log(f"[경고] DB 완료기록 조회 실패: {e}")
+            prev = None
+        if prev:
+            paths = [p for p in (prev.get("subtitle_path") or "").splitlines() if p.strip()]
+            if paths and all(os.path.exists(p) for p in paths):
+                real_title = prev.get("title") or started_title
+                log(f"[SKIP] 이미 받음 ({prev.get('finished_at')}) → 재요청 안 함: {real_title}")
+                CACHED_LIST.append(real_title)
+                return "cached", False
+            log(f"[안내] 완료 기록은 있으나 파일이 없음 → 다시 받음: {started_title}")
+
     job_id = None
     if db_conn is not None:
         try:
@@ -808,6 +830,8 @@ def finalize():
 
     print("\n======= 자막 성공 =======")
     print("(없음)" if not SUCCESS_LIST else "\n".join(f"+ {t}" for t in SUCCESS_LIST))
+    print("\n======= 이미 받아둠 (재요청 안 함) =======")
+    print("(없음)" if not CACHED_LIST else "\n".join(f"= {t}" for t in CACHED_LIST))
     print("\n======= 조건 불만족으로 스킵 =======")
     if SKIPPED_LIST:
         for item in SKIPPED_LIST:

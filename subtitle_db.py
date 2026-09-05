@@ -103,6 +103,21 @@ def db_record_finish(conn: sqlite3.Connection, job_id: int, status: str,
     conn.commit()
 
 
+def db_last_success(conn: sqlite3.Connection, url: str, langs_str: str):
+    """같은 URL+언어의 가장 최근 시도가 success면 그 행 dict, 아니면 None.
+
+    P1-1 중복 방지용: 이미 받은 자막은 유튜브에 다시 물어보지 않습니다.
+    """
+    row = conn.execute(
+        """SELECT * FROM downloads WHERE url = ? AND langs = ?
+           ORDER BY id DESC LIMIT 1""",
+        (url, langs_str),
+    ).fetchone()
+    if row is not None and row["status"] == "success":
+        return dict(row)
+    return None
+
+
 def db_latest_failed(conn: sqlite3.Connection):
     """URL별 '가장 최근 시도'가 failed인 목록 (재시도 대상). 오래된 실패 순으로 정렬."""
     rows = conn.execute(
