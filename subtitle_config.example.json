@@ -1,0 +1,12 @@
+{
+  "download_dir": "C:\\Users\\rpt53\\Downloads",
+  "sleep_between_videos_min": 2.0,
+  "sleep_between_videos_max": 5.0,
+  "sleep_on_429_base": 60,
+  "cookie_refresh_every_n_videos": 20,
+  "sleep_retry_min": 8.0,
+  "sleep_retry_max": 15.0,
+  "max_consecutive_429": 3,
+  "stale_running_minutes": 30,
+  "fallback_langs": ["en"]
+}
