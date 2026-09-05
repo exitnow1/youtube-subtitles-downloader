@@ -484,25 +484,50 @@ def _db_fail_once(db_conn, url, title, mode, langs, auto_subs, sub_format, reaso
         log(f"[경고] DB 실패 기록 실패: {e}")
 
 
-def _build_fallback_plan(langs, auto_subs):
-    """(언어, 자동자막, 설명) 후보 순서표.
-
-    1순위: 사용자 설정 그대로
-    2순위: 같은 언어 + 자동자막 켜기 (꺼져 있었을 때만)
-    3순위: 영어(en) + 자동자막 켜기 (아직 안 물어봤을 때만)
-    'all'을 요청했으면 1순위에서 전부를 본 것이므로 추가 없음.
+def detect_title_lang(title):
+    """영상 제목의 주 언어 판별: 한글(가-힣) vs 영문 개수 비교.
+    'ko' / 'en' / None(판별 불가)을 돌려줍니다. 동점이면 ko 우선.
     """
+    if not title or not isinstance(title, str):
+        return None
+    ko = len(re.findall(r"[가-힣]", title))
+    en = len(re.findall(r"[A-Za-z]", title))
+    if ko == 0 and en == 0:
+        return None
+    return "ko" if ko >= en else "en"
+
+
+def _build_fallback_plan(langs, auto_subs):
+    """1순위 후보 (사용자 요청 설정). 나머지는 제목을 안 뒤에 동적으로 만듦."""
     lang_list = list(langs) if isinstance(langs, (list, tuple)) else [langs]
-    plan = [(lang_list, auto_subs,
+    return [(lang_list, auto_subs,
              f"요청 설정({','.join(lang_list)}{',자동' if auto_subs else ''})")]
-    if "all" in lang_list:
-        return plan
-    if not auto_subs:
-        plan.append((lang_list, True, f"자동자막 폴백({','.join(lang_list)}+자동)"))
-    fb = [l for l in FALLBACK_LANGS if l not in lang_list]
-    if fb:
-        plan.append((fb, True, f"언어 폴백({','.join(fb)}+자동)"))
-    return plan
+
+
+def _build_title_rest(tried, req_langs, title):
+    """1순위에서 자막이 0개일 때, 영상 제목 언어로 나머지 후보를 만듦.
+    tried: 이미 물어본 (언어튜플, 자동여부) 집합 (중복 방지).
+    순서: 제목언어 자동 → 요청언어 자동 → 제목언어 수동 → 영어 자동.
+    """
+    req_list = list(req_langs) if isinstance(req_langs, (list, tuple)) else [req_langs]
+    tlang = detect_title_lang(title)
+    rest = []
+
+    def consider(lang_list, auto, label):
+        key = (tuple(lang_list), auto)
+        if key not in tried:
+            tried.add(key)
+            rest.append((list(lang_list), auto, label))
+
+    if tlang:
+        consider([tlang], True, f"제목언어 자동({tlang}+자동)")
+        consider(req_list, True, "요청언어 자동")
+        consider([tlang], False, f"제목언어 수동({tlang})")
+    elif "all" not in req_list:
+        consider(req_list, True, "자동자막 폴백")
+    for fb in FALLBACK_LANGS:
+        consider([fb], True, f"언어 폴백({fb}+자동)")
+    return rest
 
 
 def _download_round(url, outtmpl, sub_filter, langs, auto_subs, sub_format, noplaylist, max_attempts):
@@ -593,10 +618,17 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             job_id = None
 
     saw_429 = False
-    plan = _build_fallback_plan(langs, auto_subs)
-    for round_no, (round_langs, round_auto, round_label) in enumerate(plan, 1):
+    # 1순위는 요청 설정. 제목을 안 뒤에야 나머지 후보를 정할 수 있어 큐 방식 사용.
+    req_list = list(langs) if isinstance(langs, (list, tuple)) else [langs]
+    pending = _build_fallback_plan(langs, auto_subs)
+    tried = {(tuple(l), a) for l, a, _ in pending}
+    tried_labels = [label for _, _, label in pending]
+    round_no = 0
+    while pending:
+        round_langs, round_auto, round_label = pending.pop(0)
+        round_no += 1
         if round_no > 1:
-            log(f"[폴백 {round_no}/{len(plan)}] {round_label}")
+            log(f"[폴백 {round_no}] {round_label}")
         kept, round_429, fatal, fatal_msg = _download_round(
             url, outtmpl, sub_filter, round_langs, round_auto, sub_format,
             noplaylist, max_attempts)
@@ -622,7 +654,7 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
         found = find_subtitle_files(video_id)
         if found:
             finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            stamped = add_header_to_subtitles(video_id, real_title, url, finished_at)
+            add_header_to_subtitles(video_id, real_title, url, finished_at)
             note = "" if round_no == 1 else f" ({round_label}로 저장)"
             log(f"[END] 자막 저장: {real_title}{note} ({len(found)}개 파일)")
             SUCCESS_LIST.append(real_title)
@@ -630,11 +662,16 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             _db_finish(db_conn, job_id, "success", note.strip(), real_title, "\n".join(all_paths))
             return "downloaded", saw_429
         log(f"[폴백] '{round_label}'에서 자막 0개 → 다음 후보 시도", to_file=False)
+        if not pending:
+            # 1순위가 비었으니 이제 제목 언어를 알 수 있음 → 나머지 후보 생성
+            for cand in _build_title_rest(tried, req_list, real_title):
+                pending.append(cand)
+                tried_labels.append(cand[2])
     # 모든 후보 소진 → 자막 없음 확정 (실패가 아니라 별도 분류, 재시도 목록 제외)
     real_title = sub_filter.seen_title or started_title
-    tried = " → ".join(label for _, _, label in plan)
-    reason = f"자막 없음(시도: {tried})"
-    log(f"[자막 없음] {real_title} ({tried})")
+    tried_str = " → ".join(tried_labels)
+    reason = f"자막 없음(시도: {tried_str})"
+    log(f"[자막 없음] {real_title} ({tried_str})")
     NO_SUB_LIST.append({"title": real_title, "url": url, "reason": reason})
     _db_finish(db_conn, job_id, "no_subtitle", reason, real_title, "")
     return "no_subtitle", saw_429
