@@ -22,6 +22,9 @@ FAIL_LIST_*.txt
 *.sqlite
 *.sqlite3
 
+# 자막 다운로더 개인 설정 (기본 본보기는 subtitle_config.example.json)
+subtitle_config.json
+
 # Downloads (로컬 다운로드 폴더)
 Downloads/
 downloads/

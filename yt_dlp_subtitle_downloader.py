@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import json
 import random
 import argparse
 import subprocess
@@ -92,6 +93,92 @@ DATE_OPS = {
     "!=": "!=",
     "<": "<", "<=": "<=", ">": ">", ">=": ">=",
 }
+
+# =============== 설정 파일 (P3-1) ===============
+# 스크립트 옆 subtitle_config.json에 저장 위치·대기 시간 등을 적어두면
+# 코드를 열지 않고 메모장으로 바꿀 수 있습니다.
+# subtitle_config.example.json이 기본 본보기로 커밋되고,
+# 실제 파일이 없으면 첫 실행 때 기본값으로 자동 생성됩니다.
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitle_config.json")
+CONFIG_EXAMPLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subtitle_config.example.json")
+
+DEFAULT_CONFIG = {
+    "download_dir": r"C:\Users\rpt53\Downloads",
+    "sleep_between_videos_min": 2.0,
+    "sleep_between_videos_max": 5.0,
+    "sleep_on_429_base": 60,
+    "cookie_refresh_every_n_videos": 20,
+    "sleep_retry_min": 8.0,
+    "sleep_retry_max": 15.0,
+    "max_consecutive_429": 3,
+    "stale_running_minutes": 30,
+    "fallback_langs": ["en"],
+}
+
+STALE_RUNNING_MINUTES = 30  # running 흔적 정리 기준 (설정 파일로 변경 가능)
+
+
+def load_config(path=None):
+    """설정 파일 읽기. 없으면 기본값으로 생성. 깨졌으면 기본값 + 경고."""
+    path = path or CONFIG_PATH
+    if not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+            print(f"[안내] 설정 파일 생성: {path} (메모장으로 수정 가능)")
+        except Exception as e:
+            print(f"[경고] 설정 파일 생성 실패 → 기본값 사용: {e}")
+        return dict(DEFAULT_CONFIG)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[경고] 설정 파일 파싱 실패 → 기본값 사용: {e}")
+        return dict(DEFAULT_CONFIG)
+    if not isinstance(data, dict):
+        print("[경고] 설정 파일 형식 오류 → 기본값 사용")
+        return dict(DEFAULT_CONFIG)
+    cfg = dict(DEFAULT_CONFIG)
+    for k, v in data.items():
+        if k in cfg:
+            cfg[k] = v
+        # 모르는 키는 무시 (새 버전 설정 파일 호환용)
+    return cfg
+
+
+def _cfg_num(cfg, key, kind):
+    """숫자 설정값 읽기 (이상하면 기본값 + 경고)."""
+    try:
+        return kind(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        print(f"[경고] 설정 '{key}' 오류 → 기본값 {DEFAULT_CONFIG[key]} 사용")
+        return DEFAULT_CONFIG[key]
+
+
+def apply_config(cfg):
+    """설정값을 전역에 반영 + 파생 경로 재계산."""
+    global DOWNLOAD_DIR, SUBTITLE_DIR, COOKIE_PATH, LOG_FILE, DB_PATH, LAST_DIR_FILE
+    global SLEEP_BETWEEN_VIDEOS_MIN, SLEEP_BETWEEN_VIDEOS_MAX, SLEEP_ON_429_BASE
+    global COOKIE_REFRESH_EVERY_N_VIDEOS, SLEEP_RETRY_MIN, SLEEP_RETRY_MAX
+    global MAX_CONSECUTIVE_429, STALE_RUNNING_MINUTES, FALLBACK_LANGS
+    DOWNLOAD_DIR = str(cfg.get("download_dir") or DEFAULT_CONFIG["download_dir"])
+    SUBTITLE_DIR = os.path.join(DOWNLOAD_DIR, "subtitles")
+    COOKIE_PATH = os.path.join(DOWNLOAD_DIR, COOKIE_FILENAME)
+    LOG_FILE = os.path.join(DOWNLOAD_DIR, "subtitle_download.log")
+    DB_PATH = os.path.join(DOWNLOAD_DIR, "subtitle_jobs.db")
+    LAST_DIR_FILE = os.path.join(DOWNLOAD_DIR, ".last_subtitle_dir")
+    SLEEP_BETWEEN_VIDEOS_MIN = _cfg_num(cfg, "sleep_between_videos_min", float)
+    SLEEP_BETWEEN_VIDEOS_MAX = _cfg_num(cfg, "sleep_between_videos_max", float)
+    SLEEP_ON_429_BASE = _cfg_num(cfg, "sleep_on_429_base", int)
+    COOKIE_REFRESH_EVERY_N_VIDEOS = _cfg_num(cfg, "cookie_refresh_every_n_videos", int)
+    SLEEP_RETRY_MIN = _cfg_num(cfg, "sleep_retry_min", float)
+    SLEEP_RETRY_MAX = _cfg_num(cfg, "sleep_retry_max", float)
+    MAX_CONSECUTIVE_429 = _cfg_num(cfg, "max_consecutive_429", int)
+    STALE_RUNNING_MINUTES = _cfg_num(cfg, "stale_running_minutes", int)
+    fb = cfg.get("fallback_langs") or ["en"]
+    fb = [str(l).strip() for l in fb] if isinstance(fb, (list, tuple)) else [str(fb)]
+    FALLBACK_LANGS = tuple(l for l in fb if l) or ("en",)
 
 # =============== 유틸 ===============
 
@@ -1340,7 +1427,7 @@ def run_headless_retry(selection_raw="all"):
     conn = db_init(DB_PATH)
     try:
         try:
-            cleaned = db_cleanup_stale_running(conn)
+            cleaned = db_cleanup_stale_running(conn, STALE_RUNNING_MINUTES)
         except Exception:
             cleaned = 0
         if cleaned:
@@ -1374,6 +1461,8 @@ def run_headless_retry(selection_raw="all"):
 
 def main():
     global SUBTITLE_DIR, HEADLESS
+    apply_config(load_config())  # 설정 파일 우선 적용 (없으면 기본값으로 생성)
+    log(f"설정 파일: {CONFIG_PATH}")
     args = parse_cli()
     HEADLESS = bool(args.headless or args.retry_failed is not None)
     if args.retry_failed is not None:
@@ -1382,9 +1471,9 @@ def main():
     SUBTITLE_DIR = ask_save_location()  # 저장 위치 먼저 확정 (이후 모든 경로가 여기를 따름)
     ensure_dirs()
     db_conn = db_init(DB_PATH)
-    # P1-2: 지난 실행이 강제종료로 남긴 running 흔적 정리 (30분 지난 것만)
+    # P1-2: 지난 실행이 강제종료로 남긴 running 흔적 정리 (설정 기준 지난 것만)
     try:
-        cleaned = db_cleanup_stale_running(db_conn)
+        cleaned = db_cleanup_stale_running(db_conn, STALE_RUNNING_MINUTES)
     except Exception as e:
         log(f"[경고] running 흔적 정리 실패: {e}")
         cleaned = 0
