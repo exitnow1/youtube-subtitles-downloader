@@ -61,7 +61,7 @@ SLEEP_RETRY_MIN = 8.0
 SLEEP_RETRY_MAX = 15.0
 MAX_CONSECUTIVE_429 = 3  # 429가 3회 연속이면 나머지 중단 (차단기)
 
-# 없는 영상(삭제/비공개/찾을 수 없음) 신호 — 재시도해도 살아나지 않으므로 1회로 종료
+# 없는 영상(삭제/비공개/찾을 수 없음) 신호 - 재시도해도 살아나지 않으므로 1회로 종료
 UNAVAILABLE_PATTERNS = (
     "video unavailable",
     "private video",
@@ -584,7 +584,7 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
 
     DB에 시도 시작/종료(시각·제목·URL·결과)를 기록하고, 성공 시 자막 파일
     상단에 완료시각·제목·URL 헤더를 기입합니다.
-    반환: (result, saw_429) — result는 downloaded / skipped / failed / cached / no_subtitle.
+    반환: (result, saw_429) - result는 downloaded / skipped / failed / cached / no_subtitle.
     cached는 DB에 같은 언어 완료 기록이 있고 파일도 그대로 있을 때
     (유튜브에 요청을 1번도 보내지 않음).
     no_subtitle은 요청 언어→자동자막→영어 폴백까지 다 물어봤는데 자막이 없을 때.
@@ -867,6 +867,25 @@ def wait_until(target: datetime) -> bool:
             return False
 
 
+def recommend_retry(reason) -> tuple:
+    """실패 사유별 재시도 가이드: (행동, 안내문) 반환.
+
+    skip   - 없는 영상: 다시 해도 안 됨, 제외 권장
+    wait   - 429: IP 식힘 필요, 30분 후 예약 권장
+    cookie - 403: 쿠키 갱신 권장
+    now    - 그 외: 즉시 재시도 가능
+    """
+    r = str(reason or "")
+    if r.startswith("영상 없음"):
+        return ("skip", "재시도 무의미(없는 영상) - 제외 권장")
+    low = r.lower()
+    if "429" in low or "too many" in low:
+        return ("wait", "30분 후 예약 권장 (IP 식힘 필요)")
+    if "403" in low or "forbidden" in low:
+        return ("cookie", "쿠키 갱신 권장 (브라우저를 닫고 실행하면 자동 갱신됨)")
+    return ("now", "즉시 재시도 가능")
+
+
 def run_retry(db_conn):
     """모드 4: DB 실패 목록 → 번호 선택 → 즉시/예약 재시도.
 
@@ -880,9 +899,16 @@ def run_retry(db_conn):
         log("[안내] 재시도할 실패 기록이 없습니다")
         return
     print("\n======= 실패 목록 (URL별 가장 최근 실패) =======")
-    for i, row in enumerate(failed, 1):
-        print(f"{i}. {row['title'] or '(제목없음)'} | {row['url']}")
+    marks = {"skip": "[제외권장]", "wait": "[예약권장]", "cookie": "[쿠키권장]", "now": "[재시도가능]"}
+    recs = [recommend_retry(row["reason"]) for row in failed]
+    for i, (row, (act, msg)) in enumerate(zip(failed, recs), 1):
+        print(f"{i}. {marks[act]} {row['title'] or '(제목없음)'} | {row['url']}")
         print(f"   실패시각: {row['finished_at']} | 누적시도 {row['attempt_no']}회 | {str(row['reason'])[:80]}")
+        print(f"   → 가이드: {msg}")
+    n_skip = sum(1 for a, _ in recs if a == "skip")
+    n_wait = sum(1 for a, _ in recs if a == "wait")
+    if n_skip or n_wait:
+        print(f"   요약: 제외권장 {n_skip}개, 예약권장 {n_wait}개")
     try:
         picked = parse_selection(
             input("재시도할 번호 (예: all / 1,3 / 2-5, Enter=전체): "), len(failed))
@@ -894,7 +920,25 @@ def run_retry(db_conn):
         return
     targets = [failed[i - 1] for i in picked]
 
-    target_time = ask_schedule()
+    # P2-2: 없는 영상은 골라도 소용없으니 제외 제안
+    gone = [r for r in targets if recommend_retry(r["reason"])[0] == "skip"]
+    if gone:
+        ans = input(f"재시도해도 안 되는 영상 {len(gone)}개를 제외할까요? (Y/n, Enter=Y): ").strip().lower()
+        if ans != "n":
+            targets = [r for r in targets if recommend_retry(r["reason"])[0] != "skip"]
+            log(f"{len(gone)}개 제외 → {len(targets)}개 재시도")
+            if not targets:
+                log("남은 항목 없음 → 취소")
+                return
+
+    # P2-2: 429가 섞여 있으면 30분 후 예약 제안
+    target_time = None
+    if any(recommend_retry(r["reason"])[0] == "wait" for r in targets):
+        ans = input("429 실패가 있어 30분 후 예약을 권장합니다. 예약할까요? (y/N, Enter=지금실행): ").strip().lower()
+        if ans == "y":
+            target_time = datetime.now() + timedelta(minutes=30)
+    if target_time is None:
+        target_time = ask_schedule()
     if target_time is not None:
         log(f"예약: {target_time.strftime('%Y-%m-%d %H:%M')}에 재시도 시작")
         if not wait_until(target_time):
@@ -1101,7 +1145,7 @@ def main():
         cleaned = 0
     if cleaned:
         log(f"[정리] 비정상 종료 흔적 {cleaned}건을 interrupted로 정리 "
-            f"(모드 4 대상 아님 — 원본 모드로 다시 돌리면 미완료분만 처리됨)")
+            f"(모드 4 대상 아님 - 원본 모드로 다시 돌리면 미완료분만 처리됨)")
     try:
         _main_menu(db_conn)
     except KeyboardInterrupt:
