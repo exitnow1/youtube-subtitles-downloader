@@ -882,6 +882,40 @@ def finalize():
 
 # =============== 입력 도우미 ===============
 
+LAST_DIR_FILE = os.path.join(DOWNLOAD_DIR, ".last_subtitle_dir")
+
+
+def _load_last_save_dir():
+    """지난번에 쓴 저장 폴더 (없으면 None)."""
+    try:
+        with open(LAST_DIR_FILE, encoding="utf-8") as f:
+            p = f.read().strip()
+            return p or None
+    except Exception:
+        return None
+
+
+def ask_save_location():
+    """자막 저장 폴더 묻기. Enter=지난번(없으면 기본값). 없으면 만들고, 실패하면 기본값."""
+    default = _load_last_save_dir() or SUBTITLE_DIR
+    ans = input(f"자막 저장 폴더 (Enter={default}): ").strip().strip('"').strip("'")
+    chosen = os.path.abspath(os.path.expanduser(ans)) if ans else default
+    try:
+        os.makedirs(chosen, exist_ok=True)
+    except Exception as e:
+        log(f"[경고] 폴더 생성 실패 → 기본값 사용: {e}")
+        chosen = SUBTITLE_DIR
+        os.makedirs(chosen, exist_ok=True)
+    try:
+        with open(LAST_DIR_FILE, "w", encoding="utf-8") as f:
+            f.write(chosen)
+    except Exception:
+        pass
+    if os.path.normcase(chosen) != os.path.normcase(SUBTITLE_DIR):
+        log(f"저장 위치: {chosen}")
+    return chosen
+
+
 def ask_lang_config():
     """자막 언어/자동자막/형식 묻기."""
     langs_raw = input("자막 언어 (쉼표 구분, 예: ko,en / 전체는 all, Enter=ko,en): ").strip()
@@ -953,6 +987,8 @@ def ask_optional_filters(with_range=True):
 # =============== 메인 ===============
 
 def main():
+    global SUBTITLE_DIR
+    SUBTITLE_DIR = ask_save_location()  # 저장 위치 먼저 확정 (이후 모든 경로가 여기를 따름)
     ensure_dirs()
     db_conn = db_init(DB_PATH)
     # P1-2: 지난 실행이 강제종료로 남긴 running 흔적 정리 (30분 지난 것만)
