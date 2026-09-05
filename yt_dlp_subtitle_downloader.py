@@ -1,10 +1,15 @@
 """YouTube 자막 배치 다운로더 (yt-dlp 기반, 자막 전용 모드).
 
-세 가지 모드:
+세 가지 모드 + 실패 재시도 모드:
   1) 채널 전체  : 채널 링크를 주면 영상 목록을 가져와 자막을 일괄 다운로드
                   (업로드 날짜 6종 연산자 + 길이 + 번호 범위로 조건 지정 가능)
   2) 개별 영상  : 영상 URL 1개의 자막 다운로드
   3) 재생목록   : 재생목록 내 영상 자막 다운로드 (전체 or 조건 지정)
+  4) 실패 재시도: DB에 남은 실패 목록을 골라 즉시/예약 재시도 (안전 간격 + 차단기)
+
+모든 시도는 SQLite DB(subtitle_jobs.db)에 시작/종료 시각, 제목, URL 등과 함께
+기록됩니다. 저장된 각 자막 파일 상단에는 다운로드 완료 시각·영상 제목·URL이
+기입됩니다 (vtt=NOTE 주석, 그 외=# 주석).
 
 영상 파일은 받지 않습니다 (--skip-download 상당). 영상당 요청은
 "영상 정보 1회 + 자막 파일 1~2회"라 미디어 다운로드 대비 요청량이 1/100 수준이라
@@ -18,10 +23,16 @@ import os
 import re
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 import http.cookiejar as cookielib
 import browser_cookie3  # pip install browser-cookie3
 from yt_dlp import YoutubeDL  # pip install yt-dlp
+
+from subtitle_db import (
+    db_init, db_record_start, db_record_finish,
+    db_latest_failed, db_count_by_status,
+)
 
 # =============== 환경 설정 ===============
 DOWNLOAD_DIR = r"C:\Users\rpt53\Downloads"
@@ -29,6 +40,7 @@ SUBTITLE_DIR = os.path.join(DOWNLOAD_DIR, "subtitles")
 COOKIE_FILENAME = "cookies.txt"
 COOKIE_PATH = os.path.join(DOWNLOAD_DIR, COOKIE_FILENAME)
 LOG_FILE = os.path.join(DOWNLOAD_DIR, "subtitle_download.log")
+DB_PATH = os.path.join(DOWNLOAD_DIR, "subtitle_jobs.db")
 
 # 결과 집계용
 SUCCESS_LIST = []  # 다운로드 시도된 영상 제목
@@ -40,6 +52,14 @@ SLEEP_BETWEEN_VIDEOS_MIN = 2.0
 SLEEP_BETWEEN_VIDEOS_MAX = 5.0
 SLEEP_ON_429_BASE = 60  # 429 시 대기
 COOKIE_REFRESH_EVERY_N_VIDEOS = 20  # 20개 영상마다 쿠키 갱신
+
+# --- 재시도 안전값 (실패했 easing던 영상들이라 더 여유 있게) ---
+SLEEP_RETRY_MIN = 8.0
+SLEEP_RETRY_MAX = 15.0
+MAX_CONSECUTIVE_429 = 3  # 429가 3회 연속이면 나머지 중단 (차단기)
+
+# 자막 파일 확장자 (헤더 기입 대상 탐색용)
+SUBTITLE_EXTS = ("vtt", "srt", "ass", "ssa", "lrc", "ttml", "srv1", "srv2", "srv3", "json3")
 
 # 날짜 연산자 (사용자 입력 → 내부 연산)
 DATE_OPS = {
@@ -207,6 +227,8 @@ class SubtitleFilter:
         self.dur_max_sec = dur_max_sec
         self.last_kept = None   # True=진행, False=스킵 (호출부가 결과 분류에 사용)
         self.last_reason = ""
+        self.seen_title = None  # yt-dlp가 넘겨준 실제 영상 제목 (DB/헤더용)
+        self.seen_id = None     # yt-dlp가 넘겨준 실제 영상 ID (헤더용)
 
     def _skip(self, title, reason):
         self.last_kept = False
@@ -218,6 +240,9 @@ class SubtitleFilter:
         if incomplete:
             return None
         title = info.get("title") or info.get("id") or "?"
+        # 실제 제목/ID를 기억해 둔다 (별도 요청 없이 DB와 자막 헤더에 사용)
+        self.seen_title = info.get("title") or info.get("id") or "?"
+        self.seen_id = info.get("id")
 
         # 1) 업로드 날짜 조건 (예: >= 20240101)
         if self.date_op:
@@ -353,33 +378,142 @@ def build_sub_outtmpl(mode: str) -> str:
     return os.path.join(SUBTITLE_DIR, template)
 
 
+def parse_video_id_from_url(url: str):
+    """watch?v= / youtu.be / shorts / embed / live 주소에서 11자 영상 ID 추출."""
+    if not url or not isinstance(url, str):
+        return None
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def find_subtitle_files(video_id: str):
+    """SUBTITLE_DIR 아래에서 해당 영상 ID가 들어간 자막 파일들 찾기."""
+    found = []
+    if not video_id:
+        return found
+    base = Path(SUBTITLE_DIR)
+    if not base.exists():
+        return found
+    for ext in SUBTITLE_EXTS:
+        found.extend(base.rglob(f"*{video_id}*.{ext}"))
+    return sorted(set(found))
+
+
+def add_header_to_subtitles(video_id, title, url, finished_at: str):
+    """다운로드된 자막 파일들 상단에 완료시각·제목·URL 기입.
+
+    vtt는 스펙상 허용된 NOTE 주석으로 (WEBVTT 바로 다음 줄),
+    그 외 형식(srt 등)은 '#' 주석 줄로 앞에 붙입니다.
+    이미 헤더가 있는 파일(재시도 등)은 건너뜁니다.
+    """
+    files = find_subtitle_files(video_id)
+    if not files:
+        log(f"[경고] 헤더 기입: 자막 파일을 찾지 못함 (id={video_id})")
+        return []
+    stamped = []
+    for fp in files:
+        try:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            log(f"[경고] 헤더 기입 실패(읽기): {fp.name} / {e}")
+            continue
+        if "Downloaded-At:" in text[:500]:
+            continue  # 이미 기입됨
+        lines = text.splitlines()
+        if fp.suffix.lower() == ".vtt" and lines and lines[0].startswith("WEBVTT"):
+            header = ["NOTE Downloaded-At: " + finished_at,
+                      "NOTE Video-Title: " + (title or "?"),
+                      "NOTE Video-URL: " + (url or "?"),
+                      ""]
+            new_text = "\n".join([lines[0]] + header + lines[1:]) + "\n"
+        else:
+            header = ["# Downloaded-At: " + finished_at,
+                      "# Video-Title: " + (title or "?"),
+                      "# Video-URL: " + (url or "?"),
+                      ""]
+            new_text = "\n".join(header + lines) + "\n"
+        try:
+            fp.write_text(new_text, encoding="utf-8")
+            stamped.append(str(fp))
+        except Exception as e:
+            log(f"[경고] 헤더 기입 실패(쓰기): {fp.name} / {e}")
+    if stamped:
+        log(f"자막 헤더 기입: {len(stamped)}개 파일")
+    return stamped
+
+
+def _db_finish(db_conn, job_id, status, reason="", title=None, subtitle_path=""):
+    """DB 종료 기록 (DB 없거나 기록 실패해도 전체 흐름은 계속)."""
+    if db_conn is None or job_id is None:
+        return
+    try:
+        db_record_finish(db_conn, job_id, status, reason, title, subtitle_path)
+    except Exception as e:
+        log(f"[경고] DB 종료 기록 실패: {e}")
+
+
+def _db_fail_once(db_conn, url, title, mode, langs, auto_subs, sub_format, reason):
+    """추출 이전 단계(목록 조회 실패 등)의 실패를 DB에 1행으로 기록."""
+    if db_conn is None:
+        return
+    try:
+        job_id = db_record_start(db_conn, url, title, mode, langs, auto_subs, sub_format)
+        db_record_finish(db_conn, job_id, "failed", reason, title, "")
+    except Exception as e:
+        log(f"[경고] DB 실패 기록 실패: {e}")
+
+
 def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
-                            langs, auto_subs: bool, sub_format: str, noplaylist: bool = False):
-    """영상 1개의 자막 다운로드. 결과에 따라 SUCCESS/SKIPPED/FAIL에 기록."""
-    outtmpl = build_sub_outtmpl(mode)
-    max_attempts = 3
+                            langs, auto_subs: bool, sub_format: str, noplaylist: bool = False,
+                            title_hint=None, db_conn=None, max_attempts: int = 3):
+    """영상 1개의 자막 다운로드.
+
+    DB에 시도 시작/종료(시각·제목·URL·결과)를 기록하고, 성공 시 자막 파일
+    상단에 완료시각·제목·URL 헤더를 기입합니다.
+    반환: (result, saw_429) — result는 downloaded / skipped / failed.
+    """
+    outtmpl = build_sub_outtmpl(mode if mode in ("playlist", "channel", "single") else "single")
+    started_title = title_hint or url
+    job_id = None
+    if db_conn is not None:
+        try:
+            job_id = db_record_start(db_conn, url, started_title, mode, langs, auto_subs, sub_format)
+        except Exception as e:
+            log(f"[경고] DB 시작 기록 실패: {e}")
+            job_id = None
+
+    saw_429 = False
     for attempt in range(1, max_attempts + 1):
         try:
             # 필터 판정 기록을 위해 영상마다 새 검사기 상태로 시작
             sub_filter.last_kept = None
             sub_filter.last_reason = ""
+            sub_filter.seen_title = None
+            sub_filter.seen_id = None
             ydl = make_sub_ydl(outtmpl, langs, auto_subs, sub_format, match_filter=sub_filter)
             if noplaylist:
                 ydl.params["noplaylist"] = True
             with ydl:
                 ydl.download([url])
             # 예외 없이 끝남 → 필터가 스킵했는지 확인
+            real_title = sub_filter.seen_title or started_title
             if sub_filter.last_kept is False:
-                SKIPPED_LIST.append({"title": url, "reason": sub_filter.last_reason})
-                return "skipped"
-            log(f"[END] 자막 저장: {url}")
-            SUCCESS_LIST.append(url)
-            return "downloaded"
+                SKIPPED_LIST.append({"title": real_title, "reason": sub_filter.last_reason})
+                _db_finish(db_conn, job_id, "skipped", sub_filter.last_reason, real_title, "")
+                return "skipped", saw_429
+            finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            video_id = sub_filter.seen_id or parse_video_id_from_url(url)
+            stamped = add_header_to_subtitles(video_id, real_title, url, finished_at)
+            log(f"[END] 자막 저장: {real_title}")
+            SUCCESS_LIST.append(real_title)
+            _db_finish(db_conn, job_id, "success", "", real_title, "\n".join(stamped))
+            return "downloaded", saw_429
         except Exception as e:
             msg = str(e).lower()
             is_429 = "429" in msg or "too many requests" in msg
             is_403 = "403" in msg or "forbidden" in msg
             if is_429:
+                saw_429 = True
                 wait = SLEEP_ON_429_BASE + random.uniform(10, 30)
                 log(f"[경고] 429 감지 (시도 {attempt}/{max_attempts}): {e} → {wait:.0f}초 대기")
                 time.sleep(wait)
@@ -395,9 +529,11 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
                     log(f"  → {backoff:.1f}초 후 재시도")
                     time.sleep(backoff)
             if attempt == max_attempts:
-                log(f"[END] 자막 실패: {url} / {e}")
-                FAIL_LIST.append({"title": url, "url": url})
-                return "failed"
+                real_title = sub_filter.seen_title or started_title
+                log(f"[END] 자막 실패: {real_title} / {e}")
+                FAIL_LIST.append({"title": real_title, "url": url})
+                _db_finish(db_conn, job_id, "failed", str(e)[:500], real_title, "")
+                return "failed", saw_429
 
 
 def _sleep_between_videos():
@@ -408,7 +544,7 @@ def _sleep_between_videos():
 
 def process_entries(entries, start_idx, end_idx, mode: str, label: str,
                     date_op=None, date_val=None, dur_min_sec=None, dur_max_sec=None,
-                    langs=None, auto_subs=True, sub_format="vtt/best"):
+                    langs=None, auto_subs=True, sub_format="vtt/best", db_conn=None):
     """목록(채널/재생목록) 공통 처리: 번호 범위 자르기 → 1개씩 자막 다운로드."""
     entries = [e for e in entries if e]
     total = len(entries)
@@ -426,6 +562,7 @@ def process_entries(entries, start_idx, end_idx, mode: str, label: str,
     log(f"[START] {label}: 총 {total}개 중 {s} ~ {e} 처리")
 
     done = 0
+    consec_429 = 0
     for idx, entry in enumerate(entries, start=1):
         if idx < s or idx > e:
             continue
@@ -434,12 +571,20 @@ def process_entries(entries, start_idx, end_idx, mode: str, label: str,
         if not vid_url:
             log(f"[경고] URL 추출 실패 idx={idx}")
             FAIL_LIST.append({"title": vid_title, "url": str(entry)})
+            _db_fail_once(db_conn, str(entry), vid_title, mode, langs, auto_subs, sub_format, "URL 추출 실패")
             continue
         done += 1
         log(f"[START] {label} {idx}/{total}: {vid_title}")
         sub_filter = SubtitleFilter(date_op, date_val, dur_min_sec, dur_max_sec)
-        download_subs_for_video(vid_url, mode, sub_filter, langs, auto_subs, sub_format)
-        log(f"[END] {label} {idx}/{total}: {vid_title}")
+        result, saw_429 = download_subs_for_video(
+            vid_url, mode, sub_filter, langs, auto_subs, sub_format,
+            title_hint=vid_title, db_conn=db_conn)
+        log(f"[END] {label} {idx}/{total}: {vid_title} → {result}")
+        # 차단기: 429가 연속되면 IP가 달아오른 상태 → 나머지 중단 (DB에 남아 나중에 재개)
+        consec_429 = consec_429 + 1 if saw_429 else 0
+        if consec_429 >= MAX_CONSECUTIVE_429:
+            log(f"[차단기] 429가 {MAX_CONSECUTIVE_429}회 연속 → 나머지 중단 (실패 목록은 DB에 보관, 모드 4로 재개 가능)")
+            break
         if done % COOKIE_REFRESH_EVERY_N_VIDEOS == 0:
             log(f"[주기] {COOKIE_REFRESH_EVERY_N_VIDEOS}개마다 쿠키 갱신")
             export_cookies_from_chrome()
@@ -464,37 +609,41 @@ def _to_entries_list(info):
 # =============== 모드별 실행 ===============
 
 def run_single(url: str, date_op=None, date_val=None, dur_min_sec=None, dur_max_sec=None,
-               langs=None, auto_subs=True, sub_format="vtt/best"):
+               langs=None, auto_subs=True, sub_format="vtt/best", db_conn=None):
     """모드 2: 개별 영상 1개의 자막."""
     export_cookies_from_chrome()
     log(f"[START] 개별 영상 자막: {url}")
     sub_filter = SubtitleFilter(date_op, date_val, dur_min_sec, dur_max_sec)
     # URL에 &list= 가 섞여 있어도 영상 1개만 처리 (재생목록 전체 받는 사고 방지)
-    download_subs_for_video(url, "single", sub_filter, langs, auto_subs, sub_format, noplaylist=True)
+    download_subs_for_video(url, "single", sub_filter, langs, auto_subs, sub_format,
+                            noplaylist=True, db_conn=db_conn)
     _sleep_between_videos()
 
 
 def run_playlist(url: str, start_idx=None, end_idx=None, date_op=None, date_val=None,
-                 dur_min_sec=None, dur_max_sec=None, langs=None, auto_subs=True, sub_format="vtt/best"):
+                 dur_min_sec=None, dur_max_sec=None, langs=None, auto_subs=True, sub_format="vtt/best",
+                 db_conn=None):
     """모드 3: 재생목록 내 영상 자막 (전체 or 조건)."""
     export_cookies_from_chrome()
     info = fetch_flat_list(url)
     if info is None:
         log(f"[END] 정보를 가져오지 못함: {url}")
         FAIL_LIST.append({"title": url, "url": url})
+        _db_fail_once(db_conn, url, url, "playlist", langs, auto_subs, sub_format, "목록 조회 실패")
         return
     entries = _to_entries_list(info)
     if entries is None:  # 재생목록이 아니라 단일 영상이면 그대로 처리
         log("[안내] 재생목록이 아니라 단일 영상으로 처리합니다")
-        run_single(url, date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format)
+        run_single(url, date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format, db_conn)
         return
     title = info.get("title") or "재생목록"
     process_entries(entries, start_idx, end_idx, "playlist", f"재생목록({title})",
-                    date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format)
+                    date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format, db_conn)
 
 
 def run_channel(url: str, start_idx=None, end_idx=None, date_op=None, date_val=None,
-                dur_min_sec=None, dur_max_sec=None, langs=None, auto_subs=True, sub_format="vtt/best"):
+                dur_min_sec=None, dur_max_sec=None, langs=None, auto_subs=True, sub_format="vtt/best",
+                db_conn=None):
     """모드 1: 채널 전체 영상 자막 (전체 or 날짜/길이/번호 조건)."""
     url = normalize_channel_url(url)
     log(f"채널 URL 정규화 → {url}")
@@ -504,15 +653,144 @@ def run_channel(url: str, start_idx=None, end_idx=None, date_op=None, date_val=N
     if info is None:
         log(f"[END] 정보를 가져오지 못함: {url}")
         FAIL_LIST.append({"title": url, "url": url})
+        _db_fail_once(db_conn, url, url, "channel", langs, auto_subs, sub_format, "채널 목록 조회 실패")
         return
     entries = _to_entries_list(info)
     if entries is None:
         log("[경고] 채널 목록이 아니라 단일 항목입니다. 개별 모드로 처리합니다")
-        run_single(url, date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format)
+        run_single(url, date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format, db_conn)
         return
     channel = info.get("channel") or info.get("uploader") or "채널"
     process_entries(entries, start_idx, end_idx, "channel", f"채널({channel})",
-                    date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format)
+                    date_op, date_val, dur_min_sec, dur_max_sec, langs, auto_subs, sub_format, db_conn)
+
+
+# =============== 실패 재시도 / 예약 (모드 4) ===============
+
+def parse_selection(sel: str, total: int):
+    """'all' / '1,3' / '2-5' / '1,3-5' → 1부터 시작 번호 리스트 (Enter=전체)."""
+    s = sel.strip().lower()
+    if s in ("", "all", "전체", "전부"):
+        return list(range(1, total + 1))
+    picked = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a.strip()), int(b.strip())
+            if a > b:
+                a, b = b, a
+            picked.update(range(max(1, a), min(total, b) + 1))
+        else:
+            n = int(part)
+            if 1 <= n <= total:
+                picked.add(n)
+    return sorted(picked)
+
+
+def ask_schedule():
+    """지금 / N분 후 / HH:MM 중 선택 → 목표 시각(datetime) 또는 None(지금)."""
+    ans = input("언제 재시도? (Enter=지금 / 예: 30분후 / 21:30): ").strip()
+    if not ans:
+        return None
+    m = re.match(r"^(\d+)\s*분\s*후?$", ans)
+    if m:
+        return datetime.now() + timedelta(minutes=int(m.group(1)))
+    m = re.match(r"^(\d{1,2}):(\d{2})$", ans)
+    if m:
+        target = datetime.now().replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                        second=0, microsecond=0)
+        if target <= datetime.now():
+            target += timedelta(days=1)  # 이미 지난 시각이면 내일
+        return target
+    log("예약 형식 오류 → 지금 실행합니다 (예: 30분후 / 21:30)")
+    return None
+
+
+def wait_until(target: datetime) -> bool:
+    """예약 시각까지 10초씩 끊어 대기. Ctrl+C면 False(취소)를 돌려줌."""
+    while True:
+        remain = (target - datetime.now()).total_seconds()
+        if remain <= 0:
+            print()
+            return True
+        m, s = divmod(int(remain), 60)
+        print(f"\r예약 대기 중... {m}분 {s}초 남음 (취소: Ctrl+C)   ", end="", flush=True)
+        try:
+            time.sleep(min(10, remain))
+        except KeyboardInterrupt:
+            print()
+            log("[취소] 예약 대기 취소")
+            return False
+
+
+def run_retry(db_conn):
+    """모드 4: DB 실패 목록 → 번호 선택 → 즉시/예약 재시도.
+
+    안전 장치: 재시도 간 8~15초 대기, 영상당 최대 3회 시도,
+    429가 3회 연속이면 나머지 중단(차단기). 중단된 항목은 DB에 그대로 남아
+    다음 실행에서 이어서 재시도할 수 있습니다.
+    재시도는 조건 필터 없이 실행합니다 (실패는 조건 문제가 아니므로).
+    """
+    failed = db_latest_failed(db_conn)
+    if not failed:
+        log("[안내] 재시도할 실패 기록이 없습니다")
+        return
+    print("\n======= 실패 목록 (URL별 가장 최근 실패) =======")
+    for i, row in enumerate(failed, 1):
+        print(f"{i}. {row['title'] or '(제목없음)'} | {row['url']}")
+        print(f"   실패시각: {row['finished_at']} | 누적시도 {row['attempt_no']}회 | {str(row['reason'])[:80]}")
+    try:
+        picked = parse_selection(
+            input("재시도할 번호 (예: all / 1,3 / 2-5, Enter=전체): "), len(failed))
+    except ValueError:
+        log("선택 파싱 실패 → 취소 (숫자와 , - 만 사용)")
+        return
+    if not picked:
+        log("선택 없음 → 취소")
+        return
+    targets = [failed[i - 1] for i in picked]
+
+    target_time = ask_schedule()
+    if target_time is not None:
+        log(f"예약: {target_time.strftime('%Y-%m-%d %H:%M')}에 재시도 시작")
+        if not wait_until(target_time):
+            return  # 예약 취소
+
+    export_cookies_from_chrome()
+    log(f"[START] 실패 재시도: {len(targets)}개")
+    consec_429 = 0
+    for n, row in enumerate(targets, 1):
+        url = row["url"]
+        langs = [p.strip() for p in (row["langs"] or "ko,en").split(",") if p.strip()]
+        auto_subs = bool(row["auto_subs"])
+        sub_format = row["sub_format"] or "vtt/best"
+        sub_mode = row["mode"] if row["mode"] in ("playlist", "channel", "single") else "single"
+        log(f"[START] 재시도 {n}/{len(targets)} (통산 {row['attempt_no'] + 1}회차): {row['title']}")
+        sub_filter = SubtitleFilter()  # 조건 없음
+        try:
+            result, saw_429 = download_subs_for_video(
+                url, sub_mode, sub_filter, langs, auto_subs, sub_format,
+                title_hint=row["title"], db_conn=db_conn)
+        except KeyboardInterrupt:
+            log("[중단] 재시도 중단 (남은 항목은 DB에 보관됨)")
+            break
+        log(f"[END] 재시도 {n}/{len(targets)}: {result}")
+        consec_429 = consec_429 + 1 if saw_429 else 0
+        if consec_429 >= MAX_CONSECUTIVE_429:
+            log(f"[차단기] 429가 {MAX_CONSECUTIVE_429}회 연속 → 나머지 중단 (모드 4로 나중에 재개 가능)")
+            break
+        if n < len(targets):
+            jitter = random.uniform(SLEEP_RETRY_MIN, SLEEP_RETRY_MAX)
+            log(f"재시도 간 대기 {jitter:.1f}초 (안전)")
+            try:
+                time.sleep(jitter)
+            except KeyboardInterrupt:
+                log("[중단] 재시도 중단 (남은 항목은 DB에 보관됨)")
+                break
+    log("[END] 실패 재시도 완료")
 
 
 # =============== 종료 정리 ===============
@@ -526,6 +804,7 @@ def finalize():
             for item in FAIL_LIST:
                 f.write(f"title={item['title']} | url={item['url']}\n")
         log(f"[END] 실패 리스트 저장 → {fail_path}")
+    log(f"작업 기록 DB → {DB_PATH} (실패 목록은 모드 4에서 재시도 가능)")
 
     print("\n======= 자막 성공 =======")
     print("(없음)" if not SUCCESS_LIST else "\n".join(f"+ {t}" for t in SUCCESS_LIST))
@@ -628,46 +907,66 @@ def ask_optional_filters(with_range=True):
 
 def main():
     ensure_dirs()
+    db_conn = db_init(DB_PATH)
+    try:
+        _main_menu(db_conn)
+    except KeyboardInterrupt:
+        log("[중단] 사용자 중단 (Ctrl+C)")
+    finally:
+        try:
+            db_conn.close()
+        except Exception:
+            pass
+
+    finalize()
+    log("[END] 전체 작업 완료")
+
+
+def _main_menu(db_conn):
     log("[START] YouTube 자막 배치 다운로드 (자막 전용 모드)")
+    try:
+        counts = db_count_by_status(db_conn)
+    except Exception:
+        counts = {}
+    failed_n = counts.get("failed", 0)
     print("=" * 55)
     print("  1) 채널 전체 자막 (날짜/길이/번호 조건 가능)")
     print("  2) 개별 영상 자막")
     print("  3) 재생목록 자막 (전체 or 조건)")
+    print(f"  4) 실패 목록 재시도/예약 (현재 실패 {failed_n}개)")
     print("=" * 55)
-    mode = input("모드 선택 (1/2/3): ").strip()
+    mode = input("모드 선택 (1/2/3/4): ").strip()
+
+    if mode == "4":
+        run_retry(db_conn)
+        return
 
     langs, auto_subs, sub_format = ask_lang_config()
 
-    try:
-        if mode == "2":
-            url = input("영상 URL: ").strip()
-            if not url:
-                log("[END] URL이 없어 종료")
-                return
-            date_op, date_val, dmin, dmax, _, _ = ask_optional_filters(with_range=False)
-            run_single(url, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format)
-        elif mode == "3":
-            url = input("재생목록 URL: ").strip()
-            if not url:
-                log("[END] URL이 없어 종료")
-                return
-            date_op, date_val, dmin, dmax, s, e = ask_optional_filters(with_range=True)
-            run_playlist(url, s, e, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format)
-        elif mode == "1":
-            url = input("채널 URL (@핸들/channel/c/user 모두 가능): ").strip()
-            if not url:
-                log("[END] URL이 없어 종료")
-                return
-            date_op, date_val, dmin, dmax, s, e = ask_optional_filters(with_range=True)
-            run_channel(url, s, e, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format)
-        else:
-            log("[END] 잘못된 모드 번호")
+    if mode == "2":
+        url = input("영상 URL: ").strip()
+        if not url:
+            log("[END] URL이 없어 종료")
             return
-    except KeyboardInterrupt:
-        log("[중단] 사용자 중단 (Ctrl+C)")
-
-    finalize()
-    log("[END] 전체 작업 완료")
+        date_op, date_val, dmin, dmax, _, _ = ask_optional_filters(with_range=False)
+        run_single(url, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format, db_conn)
+    elif mode == "3":
+        url = input("재생목록 URL: ").strip()
+        if not url:
+            log("[END] URL이 없어 종료")
+            return
+        date_op, date_val, dmin, dmax, s, e = ask_optional_filters(with_range=True)
+        run_playlist(url, s, e, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format, db_conn)
+    elif mode == "1":
+        url = input("채널 URL (@핸들/channel/c/user 모두 가능): ").strip()
+        if not url:
+            log("[END] URL이 없어 종료")
+            return
+        date_op, date_val, dmin, dmax, s, e = ask_optional_filters(with_range=True)
+        run_channel(url, s, e, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format, db_conn)
+    else:
+        log("[END] 잘못된 모드 번호")
+        return
 
 
 if __name__ == "__main__":

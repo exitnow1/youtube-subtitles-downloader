@@ -18,6 +18,9 @@ cookies.txt.tmp
 download.log
 FAIL_LIST_*.txt
 *.log
+*.db
+*.sqlite
+*.sqlite3
 
 # Downloads (로컬 다운로드 폴더)
 Downloads/

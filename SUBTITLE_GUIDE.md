@@ -11,11 +11,15 @@
 ```
 Youtube downloader/
 ├── yt_dlp_advanced_downloader_20_min.py  … (A) 영상 다운로더: 20분씩 잘라 영상 파일(.mp4) 저장
-├── yt_dlp_subtitle_downloader.py         … (B) 자막 다운로더: 자막 파일(.vtt/.srt)만 저장 ← 이번에 새로 만듦
+├── yt_dlp_subtitle_downloader.py         … (B) 자막 다운로더: 자막 파일(.vtt/.srt)만 저장
+├── subtitle_db.py                        … (C) 작업 기록 DB: 시도·완료·실패를 SQLite에 저장/조회
 ├── SUBTITLE_GUIDE.md                     … 이 문서
 ├── README.md                             … (A) 설명서
 └── .gitignore
 ```
+
+실행 중 생기는 파일(커밋 제외): `Downloads/subtitles/`(자막),
+`Downloads/subtitle_jobs.db`(DB), `Downloads/subtitle_download.log`(로그).
 
 두 스크립트는 **같은 설계 패턴(기초 공사)을 공유**합니다.
 
@@ -32,7 +36,7 @@ Youtube downloader/
 ### 그림으로 보는 (B)의 흐름
 
 ```
-[1] main() 메뉴 선택 ── 1) 채널 / 2) 개별 영상 / 3) 재생목록
+[1] main() 메뉴 선택 ── 1) 채널 / 2) 개별 영상 / 3) 재생목록 / 4) 실패 재시도·예약
           │
 [2] 자막 설정 묻기 ── 언어(ko,en/all) · 자동자막 포함여부 · 형식(vtt/srt)
           │
@@ -44,7 +48,9 @@ Youtube downloader/
           │
 [6] 영상마다 반복 ─────────────────────────────────────┐
           │                                            │
-   ┌─ yt-dlp에 "이 영상 정보 주세요" (영상당 1회) ◄─────┘
+   ┌─ DB에 "시도 시작" 기록 (시작 시각·제목·URL) ◄──────┘
+   │
+   ├─ yt-dlp에 "이 영상 정보 주세요" (영상당 1회)
    │      (이때가 차단 카운터가 도는 유일한 무거운 단계)
    │
    ├─ SubtitleFilter 검사 (내 컴퓨터 안에서, 요청 없음)
@@ -52,11 +58,16 @@ Youtube downloader/
    │
    ├─ 조건 통과 → "이 자막 파일 주세요" (가벼운 요청 1~2회)
    │
-   ├─ 저장: subtitles/채널명/제목 [영상ID].vtt
+   ├─ 저장 + 파일 상단에 헤더 기입 (완료시각·제목·URL)
+   │     저장: subtitles/채널명/제목 [영상ID].vtt
+   │
+   ├─ DB에 "시도 종료" 기록 (종료 시각·결과·사유·파일경로)
+   │
+   ├─ 429가 3회 연속이면 나머지 중단 — 차단기 (DB에 남아 모드 4로 재개)
    │
    └─ 2~5초 랜덤 대기 → 다음 영상 (20개마다 쿠키 갱신)
           │
-[7] finalize() ── 성공 / 스킵(사유 표시) / 실패 출력 + 실패 파일 + 알림
+[7] finalize() ── 성공 / 스킵(사유 표시) / 실패 출력 + 실패 파일 + DB 경로 + 알림
 ```
 
 ---
@@ -167,9 +178,49 @@ Youtube downloader/
 
 * 20분 분할 로직 (`CHUNK_SECONDS`, `download_sections`, `_part001` 파일명) — 자막은 자를 필요가 없으니 통째로 제거. 덩달아 `ffmpeg` 필수 조건도 사라짐 (자막 변환 없이 原형식 저장).
 
+### (d) 이번에 새로 추가된 것 2차 (실패 DB·재시도·헤더)
+
+| 추가 | 위치 | 설명 |
+|---|---|---|
+| 작업 기록 DB | `subtitle_db.py` + `Downloads/subtitle_jobs.db` | 시도마다 1행: 시작시각·종료시각·제목·URL·모드·언어·결과(success/skipped/failed)·사유·자막경로·시도회차. 재시도할 때마다 새 행이 쌓여 이력 보존. 비정상 종료 시 `running`으로 남음 |
+| 모드 4 실패 재시도 | `run_retry()` | DB에서 "URL별 가장 최근 실패"만 골라 번호 선택(`all / 1,3 / 2-5`) 후 재시도. 실패 당시의 언어·형식 설정을 그대로 재사용. 재시도는 조건 필터 없이 실행 (실패는 조건 문제가 아니므로) |
+| 예약 실행 | `ask_schedule()` + `wait_until()` | `Enter`=지금, `30분후`, `21:30`(지난 시각이면 내일) 지원. 10초씩 끊어 대기하며 남은 시간 표시, Ctrl+C로 취소 가능 |
+| 재시도 안전 장치 | `SLEEP_RETRY_MIN/MAX` + 차단기 | 재시도 간 8~15초 대기(일반 모드보다 김). 429가 3회 연속이면 나머지 중단하고 DB에 보관 → 다음 실행 모드 4로 이어서 가능 |
+| 자막 파일 헤더 | `add_header_to_subtitles()` | 저장된 자막마다 상단에 완료시각·영상제목·URL 기입. vtt는 스펙 허용 NOTE 주석(`WEBVTT` 다음 줄), srt 등은 `#` 주석. 이미 헤더 있으면 중복 기입 안 함. 실제 제목·ID는 필터가 받은 정보에서 가져와 추가 요청 없음 |
+
 ---
 
-## 5. 알아두면 좋은 주의사항
+## 6. 모드 4 사용 예시
+
+```
+모드 선택 (1/2/3/4): 4
+
+======= 실패 목록 (URL별 가장 최근 실패) =======
+1. 내 영상 제목 | https://www.youtube.com/watch?v=xxxx
+   실패시각: 2026-09-05T20:35:01 | 누적시도 1회 | HTTP Error 429: Too Many Requests
+2. 다른 영상 | https://www.youtube.com/watch?v=yyyy
+   실패시각: 2026-09-05T20:35:40 | 누적시도 2회 | HTTP Error 403: Forbidden
+재시도할 번호 (예: all / 1,3 / 2-5, Enter=전체): all
+언제 재시도? (Enter=지금 / 예: 30분후 / 21:30): 30분후
+예약: 2026-09-05 21:05에 재시도 시작
+예약 대기 중... 29분 50초 남음 (취소: Ctrl+C)
+```
+
+자막 파일 상단은 이렇게 생깁니다 (vtt 예시):
+
+```
+WEBVTT
+NOTE Downloaded-At: 2026-09-05 20:35:00
+NOTE Video-Title: 내 영상 제목
+NOTE Video-URL: https://www.youtube.com/watch?v=xxxx
+
+00:00:00.000 --> 00:00:02.000
+안녕하세요
+```
+
+---
+
+## 7. 알아두면 좋은 주의사항
 
 * **예정된 라이브·진행 중 라이브**: 업로드 날짜·길이 정보가 없어 날짜/길이 조건을 쓰면 스킵됩니다 (사유 표시됨). 조건 없이 받으면 자막이 있으면 저장됩니다.
 * **Shorts**: 채널 `/videos` 탭에는 Shorts가 안 들어갑니다. Shorts 자막이 필요하면 채널 주소 뒤를 `/shorts`로 직접 입력하세요 (정규화가 그대로 둡니다).
@@ -178,3 +229,5 @@ Youtube downloader/
 * **언어 `all`**: 전 언어를 다 받습니다. 자막 많은 영상은 파일이 수십 개 생길 수 있습니다.
 * **형식**: `vtt`(유튜브 원본) 또는 `srt`(플레이어 호환↑). 선택한 형식이 없으면 대체 형식으로 저장됩니다 (`vtt/best`, `srt/vtt/best`).
 * 로그: `Downloads/subtitle_download.log`, 실패 목록: `Downloads/SUB_FAIL_LIST_<시간>.txt`
+* DB: `Downloads/subtitle_jobs.db` — 프로그램이 자동 생성·관리. 파이썬 sqlite3나 DB 브라우저로 직접 조회 가능
+* srt 헤더 주의: `#` 주석 3줄이 파일 맨 앞에 붙습니다. 대부분의 플레이어는 무시하지만, 엄격한 플레이어가 경고를 내면 메모장으로 위 4줄(주석 3줄+빈 줄)을 지우면 됩니다. vtt는 NOTE가 공식 스펙이라 문제없습니다
