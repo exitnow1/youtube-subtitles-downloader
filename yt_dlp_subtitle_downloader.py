@@ -48,6 +48,7 @@ SUCCESS_LIST = []  # 다운로드 시도된 영상 제목
 SKIPPED_LIST = []  # 조건에 안 맞아 건너뛴 영상: dict {title, reason}
 FAIL_LIST = []     # 실패: dict {title, url}
 CACHED_LIST = []   # 이미 받아둠 (DB 완료 기록 + 파일 존재 → 재요청 안 함)
+NO_SUB_LIST = []   # 자막 자체가 없음 (모든 언어 후보 소진): dict {title, url, reason}
 
 # --- 차단 방지 튜닝 값 (자막은 가벼우니 미디어 모드보다 짧게) ---
 SLEEP_BETWEEN_VIDEOS_MIN = 2.0
@@ -73,6 +74,9 @@ UNAVAILABLE_PATTERNS = (
     ": 404",
     "not found",
 )
+
+# 폴백 언어 (요청 언어에 자막이 없을 때 마지막으로 물어볼 언어)
+FALLBACK_LANGS = ("en",)
 
 # 자막 파일 확장자 (헤더 기입 대상 탐색용)
 SUBTITLE_EXTS = ("vtt", "srt", "ass", "ssa", "lrc", "ttml", "srv1", "srv2", "srv3", "json3")
@@ -480,6 +484,74 @@ def _db_fail_once(db_conn, url, title, mode, langs, auto_subs, sub_format, reaso
         log(f"[경고] DB 실패 기록 실패: {e}")
 
 
+def _build_fallback_plan(langs, auto_subs):
+    """(언어, 자동자막, 설명) 후보 순서표.
+
+    1순위: 사용자 설정 그대로
+    2순위: 같은 언어 + 자동자막 켜기 (꺼져 있었을 때만)
+    3순위: 영어(en) + 자동자막 켜기 (아직 안 물어봤을 때만)
+    'all'을 요청했으면 1순위에서 전부를 본 것이므로 추가 없음.
+    """
+    lang_list = list(langs) if isinstance(langs, (list, tuple)) else [langs]
+    plan = [(lang_list, auto_subs,
+             f"요청 설정({','.join(lang_list)}{',자동' if auto_subs else ''})")]
+    if "all" in lang_list:
+        return plan
+    if not auto_subs:
+        plan.append((lang_list, True, f"자동자막 폴백({','.join(lang_list)}+자동)"))
+    fb = [l for l in FALLBACK_LANGS if l not in lang_list]
+    if fb:
+        plan.append((fb, True, f"언어 폴백({','.join(fb)}+자동)"))
+    return plan
+
+
+def _download_round(url, outtmpl, sub_filter, langs, auto_subs, sub_format, noplaylist, max_attempts):
+    """한 가지 (언어, 자동자막) 조합으로 최대 max_attempts회 시도.
+
+    반환: (kept, saw_429, fatal, fatal_msg)
+      kept=True  → 다운로드 정상 종료 (자막 파일 유무는 호출부가 확인)
+      kept=False → 조건 스킵 (날짜·길이 불만족)
+      fatal='gone'  → 없는 영상 (즉시 전체 종료해야 함)
+      fatal='error' → 재시도 소진 실패
+    """
+    saw_429 = False
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            sub_filter.last_kept = None
+            sub_filter.last_reason = ""
+            sub_filter.seen_title = None
+            sub_filter.seen_id = None
+            ydl = make_sub_ydl(outtmpl, langs, auto_subs, sub_format, match_filter=sub_filter)
+            if noplaylist:
+                ydl.params["noplaylist"] = True
+            with ydl:
+                ydl.download([url])
+            return (sub_filter.last_kept is not False), saw_429, None, ""
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if any(p in msg for p in UNAVAILABLE_PATTERNS):
+                return True, False, "gone", str(e)
+            if "429" in msg or "too many requests" in msg:
+                saw_429 = True
+                wait = SLEEP_ON_429_BASE + random.uniform(10, 30)
+                log(f"[경고] 429 감지 (시도 {attempt}/{max_attempts}): {e} → {wait:.0f}초 대기")
+                time.sleep(wait)
+                export_cookies_from_chrome()
+            elif "403" in msg or "forbidden" in msg:
+                log(f"[경고] 403 (시도 {attempt}/{max_attempts}): 쿠키 갱신 후 재시도")
+                export_cookies_from_chrome()
+                time.sleep(random.uniform(5, 10))
+            else:
+                log(f"[경고] 자막 실패 (시도 {attempt}/{max_attempts}): {e}")
+                if attempt < max_attempts:
+                    backoff = random.uniform(3, 6) * attempt
+                    log(f"  → {backoff:.1f}초 후 재시도")
+                    time.sleep(backoff)
+    return True, saw_429, "error", str(last_err)
+
+
 def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
                             langs, auto_subs: bool, sub_format: str, noplaylist: bool = False,
                             title_hint=None, db_conn=None, max_attempts: int = 3):
@@ -487,9 +559,10 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
 
     DB에 시도 시작/종료(시각·제목·URL·결과)를 기록하고, 성공 시 자막 파일
     상단에 완료시각·제목·URL 헤더를 기입합니다.
-    반환: (result, saw_429) — result는 downloaded / skipped / failed / cached.
+    반환: (result, saw_429) — result는 downloaded / skipped / failed / cached / no_subtitle.
     cached는 DB에 같은 언어 완료 기록이 있고 파일도 그대로 있을 때
     (유튜브에 요청을 1번도 보내지 않음).
+    no_subtitle은 요청 언어→자동자막→영어 폴백까지 다 물어봤는데 자막이 없을 때.
     """
     outtmpl = build_sub_outtmpl(mode if mode in ("playlist", "channel", "single") else "single")
     started_title = title_hint or url
@@ -520,65 +593,51 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             job_id = None
 
     saw_429 = False
-    for attempt in range(1, max_attempts + 1):
-        try:
-            # 필터 판정 기록을 위해 영상마다 새 검사기 상태로 시작
-            sub_filter.last_kept = None
-            sub_filter.last_reason = ""
-            sub_filter.seen_title = None
-            sub_filter.seen_id = None
-            ydl = make_sub_ydl(outtmpl, langs, auto_subs, sub_format, match_filter=sub_filter)
-            if noplaylist:
-                ydl.params["noplaylist"] = True
-            with ydl:
-                ydl.download([url])
-            # 예외 없이 끝남 → 필터가 스킵했는지 확인
-            real_title = sub_filter.seen_title or started_title
-            if sub_filter.last_kept is False:
-                SKIPPED_LIST.append({"title": real_title, "reason": sub_filter.last_reason})
-                _db_finish(db_conn, job_id, "skipped", sub_filter.last_reason, real_title, "")
-                return "skipped", saw_429
-            finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            video_id = sub_filter.seen_id or parse_video_id_from_url(url)
-            stamped = add_header_to_subtitles(video_id, real_title, url, finished_at)
-            log(f"[END] 자막 저장: {real_title}")
-            SUCCESS_LIST.append(real_title)
-            _db_finish(db_conn, job_id, "success", "", real_title, "\n".join(stamped))
-            return "downloaded", saw_429
-        except Exception as e:
-            msg = str(e).lower()
+    plan = _build_fallback_plan(langs, auto_subs)
+    for round_no, (round_langs, round_auto, round_label) in enumerate(plan, 1):
+        if round_no > 1:
+            log(f"[폴백 {round_no}/{len(plan)}] {round_label}")
+        kept, round_429, fatal, fatal_msg = _download_round(
+            url, outtmpl, sub_filter, round_langs, round_auto, sub_format,
+            noplaylist, max_attempts)
+        saw_429 = saw_429 or round_429
+        real_title = sub_filter.seen_title or started_title
+        if fatal == "gone":
             # 없는 영상은 재시도해도 살아나지 않음 → 1회로 종료, DB·실패목록에 사유 기록
-            if any(p in msg for p in UNAVAILABLE_PATTERNS):
-                real_title = sub_filter.seen_title or started_title
-                reason = f"영상 없음(삭제/비공개/찾을 수 없음): {str(e)[:300]}"
-                log(f"[영상 없음] 재시도 없이 실패 처리: {real_title}")
-                FAIL_LIST.append({"title": real_title, "url": url})
-                _db_finish(db_conn, job_id, "failed", reason, real_title, "")
-                return "failed", False
-            is_429 = "429" in msg or "too many requests" in msg
-            is_403 = "403" in msg or "forbidden" in msg
-            if is_429:
-                saw_429 = True
-                wait = SLEEP_ON_429_BASE + random.uniform(10, 30)
-                log(f"[경고] 429 감지 (시도 {attempt}/{max_attempts}): {e} → {wait:.0f}초 대기")
-                time.sleep(wait)
-                export_cookies_from_chrome()
-            elif is_403:
-                log(f"[경고] 403 (시도 {attempt}/{max_attempts}): 쿠키 갱신 후 재시도")
-                export_cookies_from_chrome()
-                time.sleep(random.uniform(5, 10))
-            else:
-                log(f"[경고] 자막 실패 (시도 {attempt}/{max_attempts}): {e}")
-                if attempt < max_attempts:
-                    backoff = random.uniform(3, 6) * attempt
-                    log(f"  → {backoff:.1f}초 후 재시도")
-                    time.sleep(backoff)
-            if attempt == max_attempts:
-                real_title = sub_filter.seen_title or started_title
-                log(f"[END] 자막 실패: {real_title} / {e}")
-                FAIL_LIST.append({"title": real_title, "url": url})
-                _db_finish(db_conn, job_id, "failed", str(e)[:500], real_title, "")
-                return "failed", saw_429
+            reason = f"영상 없음(삭제/비공개/찾을 수 없음): {fatal_msg[:300]}"
+            log(f"[영상 없음] 재시도 없이 실패 처리: {real_title}")
+            FAIL_LIST.append({"title": real_title, "url": url})
+            _db_finish(db_conn, job_id, "failed", reason, real_title, "")
+            return "failed", False
+        if fatal == "error":
+            log(f"[END] 자막 실패: {real_title} / {fatal_msg}")
+            FAIL_LIST.append({"title": real_title, "url": url})
+            _db_finish(db_conn, job_id, "failed", str(fatal_msg)[:500], real_title, "")
+            return "failed", saw_429
+        if not kept:
+            SKIPPED_LIST.append({"title": real_title, "reason": sub_filter.last_reason})
+            _db_finish(db_conn, job_id, "skipped", sub_filter.last_reason, real_title, "")
+            return "skipped", saw_429
+        video_id = sub_filter.seen_id or parse_video_id_from_url(url)
+        found = find_subtitle_files(video_id)
+        if found:
+            finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            stamped = add_header_to_subtitles(video_id, real_title, url, finished_at)
+            note = "" if round_no == 1 else f" ({round_label}로 저장)"
+            log(f"[END] 자막 저장: {real_title}{note} ({len(found)}개 파일)")
+            SUCCESS_LIST.append(real_title)
+            all_paths = [str(p) for p in found]
+            _db_finish(db_conn, job_id, "success", note.strip(), real_title, "\n".join(all_paths))
+            return "downloaded", saw_429
+        log(f"[폴백] '{round_label}'에서 자막 0개 → 다음 후보 시도", to_file=False)
+    # 모든 후보 소진 → 자막 없음 확정 (실패가 아니라 별도 분류, 재시도 목록 제외)
+    real_title = sub_filter.seen_title or started_title
+    tried = " → ".join(label for _, _, label in plan)
+    reason = f"자막 없음(시도: {tried})"
+    log(f"[자막 없음] {real_title} ({tried})")
+    NO_SUB_LIST.append({"title": real_title, "url": url, "reason": reason})
+    _db_finish(db_conn, job_id, "no_subtitle", reason, real_title, "")
+    return "no_subtitle", saw_429
 
 
 def _sleep_between_videos():
@@ -855,6 +914,12 @@ def finalize():
     print("(없음)" if not SUCCESS_LIST else "\n".join(f"+ {t}" for t in SUCCESS_LIST))
     print("\n======= 이미 받아둠 (재요청 안 함) =======")
     print("(없음)" if not CACHED_LIST else "\n".join(f"= {t}" for t in CACHED_LIST))
+    print("\n======= 자막 없음 (모든 언어 후보 소진) =======")
+    if NO_SUB_LIST:
+        for item in NO_SUB_LIST:
+            print(f"- {item['title']} | {item['url']} ({item['reason']})")
+    else:
+        print("(없음)")
     print("\n======= 조건 불만족으로 스킵 =======")
     if SKIPPED_LIST:
         for item in SKIPPED_LIST:
