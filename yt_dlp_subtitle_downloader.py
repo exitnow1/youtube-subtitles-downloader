@@ -32,6 +32,7 @@ from yt_dlp import YoutubeDL  # pip install yt-dlp
 from subtitle_db import (
     db_init, db_record_start, db_record_finish,
     db_latest_failed, db_count_by_status, db_last_success,
+    db_cleanup_stale_running,
 )
 
 # =============== 환경 설정 ===============
@@ -932,6 +933,15 @@ def ask_optional_filters(with_range=True):
 def main():
     ensure_dirs()
     db_conn = db_init(DB_PATH)
+    # P1-2: 지난 실행이 강제종료로 남긴 running 흔적 정리 (30분 지난 것만)
+    try:
+        cleaned = db_cleanup_stale_running(db_conn)
+    except Exception as e:
+        log(f"[경고] running 흔적 정리 실패: {e}")
+        cleaned = 0
+    if cleaned:
+        log(f"[정리] 비정상 종료 흔적 {cleaned}건을 interrupted로 정리 "
+            f"(모드 4 대상 아님 — 원본 모드로 다시 돌리면 미완료분만 처리됨)")
     try:
         _main_menu(db_conn)
     except KeyboardInterrupt:

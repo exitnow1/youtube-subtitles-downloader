@@ -21,7 +21,7 @@ downloads 테이블 컬럼:
 
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS downloads (
@@ -116,6 +116,25 @@ def db_last_success(conn: sqlite3.Connection, url: str, langs_str: str):
     if row is not None and row["status"] == "success":
         return dict(row)
     return None
+
+
+def db_cleanup_stale_running(conn: sqlite3.Connection, older_than_minutes: int = 30) -> int:
+    """시작된 지 오래된 running 행을 interrupted로 정리 (강제종료 흔적).
+
+    started_at은 ISO(YYYY-MM-DDTHH:MM:SS)라 문자열 비교가 시간 비교와 같습니다.
+    방금 시작된 running(정상 진행 중)은 건드리지 않습니다.
+    반환: 정리된 행 수.
+    """
+    cutoff = (datetime.now() - timedelta(minutes=older_than_minutes)).isoformat(timespec="seconds")
+    cur = conn.execute(
+        """UPDATE downloads SET status = 'interrupted',
+           reason = '시작 후 종료 기록 없음(강제종료 추정)',
+           finished_at = ?
+           WHERE status = 'running' AND started_at < ?""",
+        (now_iso(), cutoff),
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def db_latest_failed(conn: sqlite3.Connection):
