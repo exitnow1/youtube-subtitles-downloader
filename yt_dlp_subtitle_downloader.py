@@ -21,8 +21,11 @@
 
 import os
 import re
+import sys
 import time
 import random
+import argparse
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 import http.cookiejar as cookielib
@@ -50,13 +53,15 @@ FAIL_LIST = []     # 실패: dict {title, url}
 CACHED_LIST = []   # 이미 받아둠 (DB 완료 기록 + 파일 존재 → 재요청 안 함)
 NO_SUB_LIST = []   # 자막 자체가 없음 (모든 언어 후보 소진): dict {title, url, reason}
 
+HEADLESS = False  # True면 알림 팝업 생략 (--headless / --retry-failed)
+
 # --- 차단 방지 튜닝 값 (자막은 가벼우니 미디어 모드보다 짧게) ---
 SLEEP_BETWEEN_VIDEOS_MIN = 2.0
 SLEEP_BETWEEN_VIDEOS_MAX = 5.0
 SLEEP_ON_429_BASE = 60  # 429 시 대기
 COOKIE_REFRESH_EVERY_N_VIDEOS = 20  # 20개 영상마다 쿠키 갱신
 
-# --- 재시도 안전값 (실패했 easing던 영상들이라 더 여유 있게) ---
+# --- 재시도 안전값 (실패했던 영상들이라 더 여유 있게) ---
 SLEEP_RETRY_MIN = 8.0
 SLEEP_RETRY_MAX = 15.0
 MAX_CONSECUTIVE_429 = 3  # 429가 3회 연속이면 나머지 중단 (차단기)
@@ -886,64 +891,11 @@ def recommend_retry(reason) -> tuple:
     return ("now", "즉시 재시도 가능")
 
 
-def run_retry(db_conn):
-    """모드 4: DB 실패 목록 → 번호 선택 → 즉시/예약 재시도.
+def _execute_retry_targets(db_conn, targets):
+    """재시도 실행 본체 (대화형/무질문 공용).
 
-    안전 장치: 재시도 간 8~15초 대기, 영상당 최대 3회 시도,
-    429가 3회 연속이면 나머지 중단(차단기). 중단된 항목은 DB에 그대로 남아
-    다음 실행에서 이어서 재시도할 수 있습니다.
-    재시도는 조건 필터 없이 실행합니다 (실패는 조건 문제가 아니므로).
+    쿠키 1회 갱신 → 건당 재시도(8~15초 간격) → 429 3연속 차단기.
     """
-    failed = db_latest_failed(db_conn)
-    if not failed:
-        log("[안내] 재시도할 실패 기록이 없습니다")
-        return
-    print("\n======= 실패 목록 (URL별 가장 최근 실패) =======")
-    marks = {"skip": "[제외권장]", "wait": "[예약권장]", "cookie": "[쿠키권장]", "now": "[재시도가능]"}
-    recs = [recommend_retry(row["reason"]) for row in failed]
-    for i, (row, (act, msg)) in enumerate(zip(failed, recs), 1):
-        print(f"{i}. {marks[act]} {row['title'] or '(제목없음)'} | {row['url']}")
-        print(f"   실패시각: {row['finished_at']} | 누적시도 {row['attempt_no']}회 | {str(row['reason'])[:80]}")
-        print(f"   → 가이드: {msg}")
-    n_skip = sum(1 for a, _ in recs if a == "skip")
-    n_wait = sum(1 for a, _ in recs if a == "wait")
-    if n_skip or n_wait:
-        print(f"   요약: 제외권장 {n_skip}개, 예약권장 {n_wait}개")
-    try:
-        picked = parse_selection(
-            input("재시도할 번호 (예: all / 1,3 / 2-5, Enter=전체): "), len(failed))
-    except ValueError:
-        log("선택 파싱 실패 → 취소 (숫자와 , - 만 사용)")
-        return
-    if not picked:
-        log("선택 없음 → 취소")
-        return
-    targets = [failed[i - 1] for i in picked]
-
-    # P2-2: 없는 영상은 골라도 소용없으니 제외 제안
-    gone = [r for r in targets if recommend_retry(r["reason"])[0] == "skip"]
-    if gone:
-        ans = input(f"재시도해도 안 되는 영상 {len(gone)}개를 제외할까요? (Y/n, Enter=Y): ").strip().lower()
-        if ans != "n":
-            targets = [r for r in targets if recommend_retry(r["reason"])[0] != "skip"]
-            log(f"{len(gone)}개 제외 → {len(targets)}개 재시도")
-            if not targets:
-                log("남은 항목 없음 → 취소")
-                return
-
-    # P2-2: 429가 섞여 있으면 30분 후 예약 제안
-    target_time = None
-    if any(recommend_retry(r["reason"])[0] == "wait" for r in targets):
-        ans = input("429 실패가 있어 30분 후 예약을 권장합니다. 예약할까요? (y/N, Enter=지금실행): ").strip().lower()
-        if ans == "y":
-            target_time = datetime.now() + timedelta(minutes=30)
-    if target_time is None:
-        target_time = ask_schedule()
-    if target_time is not None:
-        log(f"예약: {target_time.strftime('%Y-%m-%d %H:%M')}에 재시도 시작")
-        if not wait_until(target_time):
-            return  # 예약 취소
-
     export_cookies_from_chrome()
     log(f"[START] 실패 재시도: {len(targets)}개")
     consec_429 = 0
@@ -976,6 +928,183 @@ def run_retry(db_conn):
                 log("[중단] 재시도 중단 (남은 항목은 DB에 보관됨)")
                 break
     log("[END] 실패 재시도 완료")
+
+
+# =============== 예약 영속성: Windows 작업 스케줄러 (P2-3) ===============
+# 앱 안의 예약(wait_until)은 프로세스를 켜 둬야 합니다. 진짜 예약(PC만 켜두면 됨)은
+# Windows 작업 스케줄러(schtasks)에 "--retry-failed" 무질문 실행을 등록합니다.
+
+SCHED_PREFIX = "YTSubsRetry_"
+
+
+def build_retry_command(selection):
+    """스케줄러가 실행할 명령줄 문자열 (경로 공백 대비 따옴표 처리)."""
+    cmd = f'"{sys.executable}" "{os.path.abspath(__file__)}" --retry-failed'
+    s = (selection or "").strip()
+    if s and s.lower() not in ("all", "전체", "전부"):
+        cmd += f' --retry-select "{s}"'
+    cmd += " --headless"
+    return cmd
+
+
+def build_schtasks_args(task_name, target, selection):
+    """schtasks /create 인자 목록. 당일이면 /sd 생략(로케일 날짜 문제 회피)."""
+    args = ["schtasks", "/create", "/tn", task_name,
+            "/tr", build_retry_command(selection),
+            "/sc", "once", "/st", target.strftime("%H:%M"), "/f"]
+    if target.date() != datetime.now().date():
+        args += ["/sd", target.strftime("%m/%d/%Y")]
+    return args
+
+
+def register_retry_task(target, selection):
+    """예약을 작업 스케줄러에 등록. 반환: (성공여부, 안내문)."""
+    task_name = SCHED_PREFIX + target.strftime("%Y%m%d_%H%M")
+    try:
+        proc = subprocess.run(build_schtasks_args(task_name, target, selection),
+                              capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return False, "schtasks를 찾을 수 없음 (Windows 전용 기능)"
+    except Exception as e:
+        return False, f"스케줄러 등록 실패: {e}"
+    if proc.returncode == 0:
+        return True, (f"스케줄러 등록 완료: {task_name} "
+                      f"({target.strftime('%Y-%m-%d %H:%M')} 실행, 이 창을 닫아도 됨)")
+    out = (proc.stderr or proc.stdout or "").strip()[:300]
+    return False, f"스케줄러 등록 실패: {out}"
+
+
+def list_retry_tasks():
+    """등록된 자막 재시도 예약 이름 목록 (실패 시 빈 목록)."""
+    try:
+        proc = subprocess.run(["schtasks", "/query", "/fo", "CSV", "/nh"],
+                              capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        log(f"[경고] 예약 조회 실패: {e}")
+        return []
+    if proc.returncode != 0:
+        return []
+    tasks = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = line.split('","')[0].strip().strip('"').lstrip("\\")
+        if name.startswith(SCHED_PREFIX):
+            tasks.append(name)
+    return tasks
+
+
+def delete_retry_task(task_name):
+    """예약 1건 삭제. 반환: (성공여부, 안내문)."""
+    try:
+        proc = subprocess.run(["schtasks", "/delete", "/tn", task_name, "/f"],
+                              capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, f"예약 삭제 실패: {e}"
+    if proc.returncode == 0:
+        return True, f"예약 삭제 완료: {task_name}"
+    out = (proc.stderr or proc.stdout or "").strip()[:200]
+    return False, f"예약 삭제 실패: {out}"
+
+
+def run_schedule_manager():
+    """모드 5: 등록된 예약 조회/삭제."""
+    tasks = list_retry_tasks()
+    if not tasks:
+        log("[안내] 등록된 자막 재시도 예약이 없습니다")
+        return
+    print("\n======= 등록된 자막 재시도 예약 =======")
+    for i, t in enumerate(tasks, 1):
+        print(f"{i}. {t}")
+    ans = input("삭제할 번호 (Enter=취소): ").strip()
+    if not ans:
+        return
+    try:
+        n = int(ans)
+        target = tasks[n - 1]
+    except (ValueError, IndexError):
+        log("번호 오류 → 취소")
+        return
+    ok, msg = delete_retry_task(target)
+    log(msg)
+
+
+def ask_register_scheduler(target, selection):
+    """앱 안 대기 대신 작업 스케줄러 등록을 제안. 등록 성공 시 True."""
+    ans = input("작업 스케줄러에 등록할까요? (등록하면 이 창을 닫아도 됨) (y/N): ").strip().lower()
+    if ans != "y":
+        return False
+    ok, msg = register_retry_task(target, selection)
+    log(msg)
+    if not ok:
+        log("[안내] 등록 실패 → 앱 안에서 대기합니다. 명령을 직접 실행해도 됩니다:")
+        log("  " + build_retry_command(selection))
+    return ok
+
+
+def run_retry(db_conn):
+    """모드 4: DB 실패 목록 → 번호 선택 → 즉시/예약 재시도.
+
+    안전 장치: 재시도 간 8~15초 대기, 영상당 최대 3회 시도,
+    429가 3회 연속이면 나머지 중단(차단기). 중단된 항목은 DB에 그대로 남아
+    다음 실행에서 이어서 재시도할 수 있습니다.
+    재시도는 조건 필터 없이 실행합니다 (실패는 조건 문제가 아니므로).
+    """
+    failed = db_latest_failed(db_conn)
+    if not failed:
+        log("[안내] 재시도할 실패 기록이 없습니다")
+        return
+    print("\n======= 실패 목록 (URL별 가장 최근 실패) =======")
+    marks = {"skip": "[제외권장]", "wait": "[예약권장]", "cookie": "[쿠키권장]", "now": "[재시도가능]"}
+    recs = [recommend_retry(row["reason"]) for row in failed]
+    for i, (row, (act, msg)) in enumerate(zip(failed, recs), 1):
+        print(f"{i}. {marks[act]} {row['title'] or '(제목없음)'} | {row['url']}")
+        print(f"   실패시각: {row['finished_at']} | 누적시도 {row['attempt_no']}회 | {str(row['reason'])[:80]}")
+        print(f"   → 가이드: {msg}")
+    n_skip = sum(1 for a, _ in recs if a == "skip")
+    n_wait = sum(1 for a, _ in recs if a == "wait")
+    if n_skip or n_wait:
+        print(f"   요약: 제외권장 {n_skip}개, 예약권장 {n_wait}개")
+    try:
+        sel_raw = input("재시도할 번호 (예: all / 1,3 / 2-5, Enter=전체): ")
+        picked = parse_selection(sel_raw, len(failed))
+    except ValueError:
+        log("선택 파싱 실패 → 취소 (숫자와 , - 만 사용)")
+        return
+    if not picked:
+        log("선택 없음 → 취소")
+        return
+    targets = [failed[i - 1] for i in picked]
+
+    # P2-2: 없는 영상은 골라도 소용없으니 제외 제안
+    gone = [r for r in targets if recommend_retry(r["reason"])[0] == "skip"]
+    if gone:
+        ans = input(f"재시도해도 안 되는 영상 {len(gone)}개를 제외할까요? (Y/n, Enter=Y): ").strip().lower()
+        if ans != "n":
+            targets = [r for r in targets if recommend_retry(r["reason"])[0] != "skip"]
+            log(f"{len(gone)}개 제외 → {len(targets)}개 재시도")
+            if not targets:
+                log("남은 항목 없음 → 취소")
+                return
+
+    # P2-2: 429가 섞여 있으면 30분 후 예약 제안
+    target_time = None
+    if any(recommend_retry(r["reason"])[0] == "wait" for r in targets):
+        ans = input("429 실패가 있어 30분 후 예약을 권장합니다. 예약할까요? (y/N, Enter=지금실행): ").strip().lower()
+        if ans == "y":
+            target_time = datetime.now() + timedelta(minutes=30)
+    if target_time is None:
+        target_time = ask_schedule()
+    if target_time is not None:
+        log(f"예약: {target_time.strftime('%Y-%m-%d %H:%M')}에 재시도 시작")
+        # P2-3: 스케줄러에 맡기면 이 창을 닫아도 됨. 등록 성공 시 앱 안 대기는 생략.
+        if ask_register_scheduler(target_time, sel_raw):
+            return
+        if not wait_until(target_time):
+            return  # 예약 취소
+
+    _execute_retry_targets(db_conn, targets)
 
 
 # =============== 종료 정리 ===============
@@ -1019,6 +1148,8 @@ def finalize():
         winsound.MessageBeep()
     except Exception:
         pass
+    if HEADLESS:
+        return  # 스케줄러 실행 중 팝업 금지 (멈춤 방지)
     try:
         from ctypes import windll
         windll.user32.MessageBoxW(0, "자막 다운로드 작업이 종료되었습니다.", "subtitle downloader", 0)
@@ -1132,8 +1263,67 @@ def ask_optional_filters(with_range=True):
 
 # =============== 메인 ===============
 
-def main():
+def parse_cli(argv=None):
+    """명령줄 인자. --retry-failed는 스케줄러용 무질문 실행."""
+    p = argparse.ArgumentParser(description="YouTube 자막 배치 다운로더")
+    p.add_argument("--retry-failed", nargs="?", const="all", default=None,
+                   help='실패 목록 재시도 (무질문). 예: --retry-failed / --retry-failed "1,3-5"')
+    p.add_argument("--retry-select", default=None, help="재시도 선택 (예: 1,3-5)")
+    p.add_argument("--headless", action="store_true", help="알림 팝업 생략")
+    return p.parse_known_args(argv)[0]
+
+
+def run_headless_retry(selection_raw="all"):
+    """--retry-failed 용: 질문 없이 실패 목록 재시도 (스케줄러가 호출).
+
+    없는 영상은 자동 제외. 저장 위치는 지난번 값. 팝업 없음.
+    """
     global SUBTITLE_DIR
+    SUBTITLE_DIR = _load_last_save_dir() or SUBTITLE_DIR
+    ensure_dirs()
+    log(f"[START] 무질문 실패 재시도 (선택: {selection_raw or 'all'})")
+    conn = db_init(DB_PATH)
+    try:
+        try:
+            cleaned = db_cleanup_stale_running(conn)
+        except Exception:
+            cleaned = 0
+        if cleaned:
+            log(f"[정리] running 흔적 {cleaned}건 정리")
+        failed = db_latest_failed(conn)
+        if not failed:
+            log("[안내] 재시도할 실패 기록이 없습니다")
+            return
+        try:
+            picked = parse_selection(selection_raw or "all", len(failed))
+        except ValueError:
+            log("선택 파싱 실패 → 전체 재시도")
+            picked = list(range(1, len(failed) + 1))
+        targets = [failed[i - 1] for i in picked]
+        gone = [r for r in targets if recommend_retry(r["reason"])[0] == "skip"]
+        if gone:
+            targets = [r for r in targets if recommend_retry(r["reason"])[0] != "skip"]
+            log(f"없는 영상 {len(gone)}개 자동 제외 → {len(targets)}개 재시도")
+        if not targets:
+            log("재시도 대상 없음 → 종료")
+            return
+        _execute_retry_targets(conn, targets)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    finalize()
+    log("[END] 무질문 재시도 완료")
+
+
+def main():
+    global SUBTITLE_DIR, HEADLESS
+    args = parse_cli()
+    HEADLESS = bool(args.headless or args.retry_failed is not None)
+    if args.retry_failed is not None:
+        run_headless_retry(args.retry_select or args.retry_failed)
+        return
     SUBTITLE_DIR = ask_save_location()  # 저장 위치 먼저 확정 (이후 모든 경로가 여기를 따름)
     ensure_dirs()
     db_conn = db_init(DB_PATH)
@@ -1172,11 +1362,15 @@ def _main_menu(db_conn):
     print("  2) 개별 영상 자막")
     print("  3) 재생목록 자막 (전체 or 조건)")
     print(f"  4) 실패 목록 재시도/예약 (현재 실패 {failed_n}개)")
+    print("  5) 예약 관리 (스케줄러 조회/삭제)")
     print("=" * 55)
-    mode = input("모드 선택 (1/2/3/4): ").strip()
+    mode = input("모드 선택 (1/2/3/4/5): ").strip()
 
     if mode == "4":
         run_retry(db_conn)
+        return
+    if mode == "5":
+        run_schedule_manager()
         return
 
     langs, auto_subs, sub_format = ask_lang_config()
