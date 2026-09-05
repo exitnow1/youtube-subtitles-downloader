@@ -60,6 +60,20 @@ SLEEP_RETRY_MIN = 8.0
 SLEEP_RETRY_MAX = 15.0
 MAX_CONSECUTIVE_429 = 3  # 429가 3회 연속이면 나머지 중단 (차단기)
 
+# 없는 영상(삭제/비공개/찾을 수 없음) 신호 — 재시도해도 살아나지 않으므로 1회로 종료
+UNAVAILABLE_PATTERNS = (
+    "video unavailable",
+    "private video",
+    "this video is unavailable",
+    "this video is no longer available",
+    "has been removed",
+    "has been deleted",
+    "account associated with this video has been terminated",
+    "http error 404",
+    ": 404",
+    "not found",
+)
+
 # 자막 파일 확장자 (헤더 기입 대상 탐색용)
 SUBTITLE_EXTS = ("vtt", "srt", "ass", "ssa", "lrc", "ttml", "srv1", "srv2", "srv3", "json3")
 
@@ -533,6 +547,14 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             return "downloaded", saw_429
         except Exception as e:
             msg = str(e).lower()
+            # 없는 영상은 재시도해도 살아나지 않음 → 1회로 종료, DB·실패목록에 사유 기록
+            if any(p in msg for p in UNAVAILABLE_PATTERNS):
+                real_title = sub_filter.seen_title or started_title
+                reason = f"영상 없음(삭제/비공개/찾을 수 없음): {str(e)[:300]}"
+                log(f"[영상 없음] 재시도 없이 실패 처리: {real_title}")
+                FAIL_LIST.append({"title": real_title, "url": url})
+                _db_finish(db_conn, job_id, "failed", reason, real_title, "")
+                return "failed", False
             is_429 = "429" in msg or "too many requests" in msg
             is_403 = "403" in msg or "forbidden" in msg
             if is_429:
