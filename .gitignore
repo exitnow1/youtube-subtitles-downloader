@@ -43,3 +43,6 @@ desktop.ini
 # Temp
 *.tmp
 *.bak
+
+# CodeGraph (로컬 인덱스 DB, 커밋 제외)
+.codegraph/

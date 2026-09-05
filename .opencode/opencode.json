@@ -1,0 +1,11 @@
+{
+    "$schema":  "https://opencode.ai/config.json",
+    "instructions":  [
+                         "C:\\Users\\rpt53\\.agents\\skills\\enable-codegraph\\references\\codegraph-instructions.md"
+                     ],
+    "mcp":  {
+                "codegraph":  {
+                                  "enabled":  true
+                              }
+            }
+}
