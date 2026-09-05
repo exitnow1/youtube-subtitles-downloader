@@ -57,6 +57,12 @@ def db_init(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # P2-4: 옛 DB에도 encoding 컬럼 추가 (이미 있으면 무시)
+    try:
+        conn.execute("ALTER TABLE downloads ADD COLUMN encoding TEXT DEFAULT 'utf-8'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # duplicate column name → 이미 있음
     return conn
 
 
@@ -70,14 +76,14 @@ def db_next_attempt_no(conn: sqlite3.Connection, url: str) -> int:
 
 
 def db_record_start(conn: sqlite3.Connection, url: str, title: str, mode: str,
-                    langs, auto_subs: bool, sub_format: str) -> int:
+                    langs, auto_subs: bool, sub_format: str, encoding: str = "utf-8") -> int:
     """시도 시작 기록 → 행 id 반환. 비정상 종료 시 status='running'으로 남음."""
     langs_str = ",".join(langs) if isinstance(langs, (list, tuple)) else str(langs)
     cur = conn.execute(
         """INSERT INTO downloads
-           (url, title, mode, langs, auto_subs, sub_format, status, attempt_no, started_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
-        (url, title, mode, langs_str, 1 if auto_subs else 0, sub_format,
+           (url, title, mode, langs, auto_subs, sub_format, encoding, status, attempt_no, started_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
+        (url, title, mode, langs_str, 1 if auto_subs else 0, sub_format, encoding or "utf-8",
          db_next_attempt_no(conn, url), now_iso()),
     )
     conn.commit()
