@@ -11,6 +11,9 @@ downloads 테이블 컬럼:
   langs         'ko,en' 형태
   auto_subs     1/0
   sub_format    'vtt/best' 등
+  encoding      'utf-8' / 'utf-8-sig' / 'cp949'
+  video_type    'long' / 'shorts' (수집 탭·URL·길이로 판별)
+  video_id      11자 영상 ID (헤더·스캔 대조용)
   status        running(진행중-비정상종료 흔적) / success / skipped / failed
   reason        스킵 사유 또는 실패 오류 메시지
   subtitle_path 저장된 자막 파일 경로 (여러 개면 줄바꿈 구분)
@@ -58,11 +61,15 @@ def db_init(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     # P2-4: 옛 DB에도 encoding 컬럼 추가 (이미 있으면 무시)
-    try:
-        conn.execute("ALTER TABLE downloads ADD COLUMN encoding TEXT DEFAULT 'utf-8'")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # duplicate column name → 이미 있음
+    # P5-1: video_type(long/shorts), video_id 컬럼 추가 (이미 있으면 무시)
+    for _col in ("encoding TEXT DEFAULT 'utf-8'",
+                 "video_type TEXT DEFAULT 'long'",
+                 "video_id TEXT DEFAULT ''"):
+        try:
+            conn.execute(f"ALTER TABLE downloads ADD COLUMN {_col}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # duplicate column name → 이미 있음
     return conn
 
 
@@ -76,14 +83,17 @@ def db_next_attempt_no(conn: sqlite3.Connection, url: str) -> int:
 
 
 def db_record_start(conn: sqlite3.Connection, url: str, title: str, mode: str,
-                    langs, auto_subs: bool, sub_format: str, encoding: str = "utf-8") -> int:
+                    langs, auto_subs: bool, sub_format: str, encoding: str = "utf-8",
+                    video_type: str = "long", video_id: str = "") -> int:
     """시도 시작 기록 → 행 id 반환. 비정상 종료 시 status='running'으로 남음."""
     langs_str = ",".join(langs) if isinstance(langs, (list, tuple)) else str(langs)
     cur = conn.execute(
         """INSERT INTO downloads
-           (url, title, mode, langs, auto_subs, sub_format, encoding, status, attempt_no, started_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
+           (url, title, mode, langs, auto_subs, sub_format, encoding, video_type, video_id,
+            status, attempt_no, started_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
         (url, title, mode, langs_str, 1 if auto_subs else 0, sub_format, encoding or "utf-8",
+         video_type or "long", video_id or "",
          db_next_attempt_no(conn, url), now_iso()),
     )
     conn.commit()
@@ -92,20 +102,18 @@ def db_record_start(conn: sqlite3.Connection, url: str, title: str, mode: str,
 
 def db_record_finish(conn: sqlite3.Connection, job_id: int, status: str,
                      reason: str = "", title: str | None = None,
-                     subtitle_path: str = "") -> None:
-    """시도 종료 기록. status는 success / skipped / failed 중 하나."""
+                     subtitle_path: str = "", video_id: str | None = None) -> None:
+    """시도 종료 기록. status는 success / skipped / failed / no_subtitle / interrupted."""
+    sets = ["status=?", "reason=?", "subtitle_path=?", "finished_at=?"]
+    vals: list = [status, reason, subtitle_path, now_iso()]
     if title is not None:
-        conn.execute(
-            """UPDATE downloads SET status=?, reason=?, title=?,
-               subtitle_path=?, finished_at=? WHERE id=?""",
-            (status, reason, title, subtitle_path, now_iso(), job_id),
-        )
-    else:
-        conn.execute(
-            """UPDATE downloads SET status=?, reason=?,
-               subtitle_path=?, finished_at=? WHERE id=?""",
-            (status, reason, subtitle_path, now_iso(), job_id),
-        )
+        sets.append("title=?")
+        vals.append(title)
+    if video_id is not None:
+        sets.append("video_id=?")
+        vals.append(video_id)
+    vals.append(job_id)
+    conn.execute(f"UPDATE downloads SET {', '.join(sets)} WHERE id=?", vals)
     conn.commit()
 
 
