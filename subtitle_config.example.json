@@ -8,5 +8,6 @@
   "sleep_retry_max": 15.0,
   "max_consecutive_429": 3,
   "stale_running_minutes": 30,
-  "fallback_langs": ["en"]
+  "fallback_langs": ["en"],
+  "shorts_max_seconds": 60
 }
