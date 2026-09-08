@@ -44,6 +44,29 @@ CREATE TABLE IF NOT EXISTS downloads (
 );
 CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);
 CREATE INDEX IF NOT EXISTS idx_downloads_url ON downloads(url);
+CREATE TABLE IF NOT EXISTS scans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  target_url TEXT NOT NULL,
+  target_kind TEXT DEFAULT '',
+  video_type_filter TEXT DEFAULT 'long',
+  started_at TEXT NOT NULL,
+  finished_at TEXT DEFAULT '',
+  total_count INTEGER DEFAULT 0,
+  new_count INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS scan_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scan_id INTEGER NOT NULL,
+  video_id TEXT NOT NULL,
+  title TEXT,
+  duration INTEGER,
+  video_type TEXT DEFAULT 'long',
+  url TEXT,
+  seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scan_items_videoid ON scan_items(video_id);
+CREATE INDEX IF NOT EXISTS idx_scan_items_scanid ON scan_items(scan_id);
+CREATE INDEX IF NOT EXISTS idx_scans_target ON scans(target_url);
 """
 
 
@@ -170,3 +193,111 @@ def db_count_by_status(conn: sqlite3.Connection) -> dict:
            GROUP BY status"""
     ).fetchall()
     return {r["status"]: r["c"] for r in rows}
+
+
+def normalize_scan_target(url: str) -> str:
+    """스캔 대상 정규화 (같은 채널·재생목록은 항상 같은 키).
+
+    채널: 탭(/videos|/shorts) 제거. 재생목록: list=ID만 남김. 소문자·공백 정리.
+    """
+    import re
+    u = (url or "").strip().lower().rstrip("/")
+    m = re.search(r"[?&]list=([a-z0-9_-]+)", u)
+    if m:
+        return "playlist:" + m.group(1)
+    u = re.sub(r"/(videos|shorts|streams|playlists|about|featured)$", "", u)
+    return "channel:" + u
+
+
+def db_record_scan(conn: sqlite3.Connection, target_url: str, target_kind: str,
+                   video_type_filter: str, items: list) -> dict:
+    """스캔 1회 저장. items는 dict 목록(video_id/title/duration/video_type/url).
+
+    신규 = 이번 스캔에 있고 과거 스캔에 없던 video_id.
+    반환: {"scan_id", "total", "new", "new_items"}.
+    """
+    started = now_iso()
+    cur = conn.execute(
+        """INSERT INTO scans (target_url, target_kind, video_type_filter, started_at)
+           VALUES (?, ?, ?, ?)""",
+        (target_url, target_kind, video_type_filter, started),
+    )
+    scan_id = int(cur.lastrowid)
+    known = {r["video_id"] for r in conn.execute(
+        """SELECT DISTINCT video_id FROM scan_items si
+           JOIN scans s ON s.id = si.scan_id
+           WHERE s.target_url = ? AND si.scan_id < ?""",
+        (target_url, scan_id)).fetchall()}
+    new_items = []
+    for it in items:
+        vid = (it.get("video_id") or "").strip()
+        if not vid:
+            continue
+        conn.execute(
+            """INSERT INTO scan_items
+               (scan_id, video_id, title, duration, video_type, url, seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (scan_id, vid, it.get("title") or vid,
+             it.get("duration"),
+             it.get("video_type") or "long", it.get("url") or "", now_iso()),
+        )
+        if vid not in known:
+            known.add(vid)
+            new_items.append({"video_id": vid, "title": it.get("title") or vid,
+                              "duration": it.get("duration"),
+                              "video_type": it.get("video_type") or "long",
+                              "url": it.get("url") or ""})
+    conn.execute(
+        "UPDATE scans SET finished_at=?, total_count=?, new_count=? WHERE id=?",
+        (now_iso(), len(items), len(new_items), scan_id),
+    )
+    conn.commit()
+    return {"scan_id": scan_id, "total": len(items), "new": len(new_items), "new_items": new_items}
+
+
+def db_latest_scan(conn: sqlite3.Connection, target_url: str):
+    """대상의 가장 최근 스캔 1건 (없으면 None)."""
+    row = conn.execute(
+        "SELECT * FROM scans WHERE target_url = ? ORDER BY id DESC LIMIT 1",
+        (target_url,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def db_scan_history(conn: sqlite3.Connection, target_url: str, limit: int = 10):
+    """대상의 스캔 이력 (최신순)."""
+    rows = conn.execute(
+        "SELECT * FROM scans WHERE target_url = ? ORDER BY id DESC LIMIT ?",
+        (target_url, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_missing_subs(conn: sqlite3.Connection, target_url: str = None):
+    """스캔됐는데 자막 성공 기록이 없는 영상 목록.
+
+    target_url이 없으면 전체 대상. 각 행에 subtitle_status 포함
+    (success 있으면 제외되므로 failed/skipped/시도없음을 구분해 표시).
+    """
+    if target_url:
+        latest = conn.execute(
+            "SELECT MAX(id) AS m FROM scans WHERE target_url = ?", (target_url,)).fetchone()["m"]
+        if not latest:
+            return []
+        where, params = "si.scan_id = ?", [latest]
+    else:
+        where, params = ("si.scan_id IN (SELECT MAX(id) FROM scans GROUP BY target_url)", [])
+    rows = conn.execute(
+        f"""SELECT si.video_id, si.title, si.duration, si.video_type, si.url,
+                   MAX(si.seen_at) AS last_seen,
+                   (SELECT d.status FROM downloads d
+                     WHERE d.video_id = si.video_id
+                     ORDER BY d.id DESC LIMIT 1) AS dl_status
+            FROM scan_items si
+            WHERE {where}
+            GROUP BY si.video_id
+            HAVING dl_status IS NULL OR dl_status != 'success'
+            ORDER BY last_seen DESC""",
+        params,
+    ).fetchall()
+    return [dict(r) for r in rows]
