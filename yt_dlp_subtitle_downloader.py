@@ -36,7 +36,8 @@ from yt_dlp import YoutubeDL  # pip install yt-dlp
 from subtitle_db import (
     db_init, db_record_start, db_record_finish,
     db_latest_failed, db_count_by_status, db_last_success,
-    db_cleanup_stale_running,
+    db_cleanup_stale_running, normalize_scan_target, db_record_scan,
+    db_latest_scan, db_scan_history, db_missing_subs,
 )
 
 # =============== 환경 설정 ===============
@@ -1039,6 +1040,120 @@ def run_channel(url: str, start_idx=None, end_idx=None, date_op=None, date_val=N
                     encoding, "both" if len(tabs) > 1 else video_type)
 
 
+# =============== 스캔 / 모니터 (모드 6, P5-2) ===============
+# 스캔은 목록만 가져와 DB 스냅샷으로 남깁니다 (다운로드 없음).
+# 신규 = 이번 스캔에 있고 과거 스캔에 없던 video_id.
+
+def _entry_snapshot(entry, default_tab=None):
+    """flat entry → 스냅샷 dict. ID를 확정할 수 없으면 None."""
+    if not isinstance(entry, dict):
+        return None
+    vid = entry.get("id")
+    url = _extract_video_url(entry)
+    if not vid or len(str(vid)) != 11:
+        vid = parse_video_id_from_url(url or "")
+    if not vid:
+        return None
+    etab = entry.get("_tab", default_tab)
+    return {"video_id": vid,
+            "title": entry.get("title") or vid,
+            "duration": entry.get("duration"),
+            "video_type": classify_type(entry, url, etab),
+            "url": url or f"https://www.youtube.com/watch?v={vid}"}
+
+
+def fmt_duration(sec) -> str:
+    """초 → 'MM:SS' / 'H:MM:SS'. 모르면 '길이 미상'."""
+    try:
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return "길이 미상"
+    if sec < 0:
+        return "길이 미상"
+    h, r = divmod(sec, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def run_scan(url: str, video_type: str = "long", db_conn=None):
+    """모드 6: 스캔만 실행. 스냅샷 저장 후 신규·자막없음 목록 표시. 반환: 요약 dict."""
+    export_cookies_from_chrome()
+    kind = "playlist" if re.search(r"[?&]list=", url) else "channel"
+    target = normalize_scan_target(url)
+    items = []
+    if kind == "playlist":
+        log("[안내] 재생목록을 가져옵니다 (다운로드는 하지 않음)")
+        info = fetch_flat_list(url)
+        if info is None:
+            log(f"[END] 정보를 가져오지 못함: {url}")
+            return None
+        entries = _to_entries_list(info)
+        if entries is None:
+            kind = "single"  # 단일 영상 주소
+            snap = _entry_snapshot({"id": info.get("id"), "title": info.get("title"),
+                                    "duration": info.get("duration"),
+                                    "webpage_url": info.get("webpage_url") or url})
+            items = [snap] if snap else []
+        else:
+            for e in entries:
+                s = _entry_snapshot(e)
+                if s:
+                    items.append(s)
+    else:
+        log("[안내] 채널 목록을 가져옵니다 (다운로드는 하지 않음)")
+        tabs = {"long": ["videos"], "shorts": ["shorts"], "both": ["videos", "shorts"]}.get(video_type, ["videos"])
+        for tab in tabs:
+            tab_url = normalize_channel_url(url, tab)
+            info = fetch_flat_list(tab_url)
+            if info is None:
+                log(f"[경고] {tab} 탭 목록 조회 실패 → 건너뜀")
+                continue
+            for e in (_to_entries_list(info) or []):
+                if isinstance(e, dict):
+                    e["_tab"] = tab
+                s = _entry_snapshot(e)
+                if s:
+                    items.append(s)
+    # ID 중복 제거 (both 실행 시 양 탭 겹침 대비, 먼저 본 것 유지)
+    seen, uniq = set(), []
+    for it in items:
+        if it["video_id"] not in seen:
+            seen.add(it["video_id"])
+            uniq.append(it)
+    items = uniq
+    log(f"[SCAN] {target} ({kind}): 총 {len(items)}개")
+
+    summary = None
+    if db_conn is not None:
+        try:
+            summary = db_record_scan(db_conn, target, kind, video_type, items)
+        except Exception as e:
+            log(f"[경고] 스캔 저장 실패: {e}")
+
+    print(f"\n======= 스캔 결과: {target} =======")
+    print(f"전체 {len(items)}개" + (f" / 신규 {summary['new']}개" if summary else ""))
+    if summary and summary["new_items"]:
+        print("--- 지난 스캔 이후 새 영상 ---")
+        for i, it in enumerate(summary["new_items"], 1):
+            print(f"{i}. [{it['video_type']}] {it['title']} "
+                  f"({fmt_duration(it['duration'])}) | {it['video_id']}")
+    if db_conn is not None:
+        try:
+            missing = db_missing_subs(db_conn, target)
+        except Exception as e:
+            log(f"[경고] 자막없음 조회 실패: {e}")
+            missing = []
+        print(f"--- 자막 없는 영상 {len(missing)}개 (빨강: 당장 받을 후보) ---")
+        for i, m in enumerate(missing[:50], 1):
+            st = m["dl_status"] or "미시도"
+            print(f"{i}. [{m['video_type']}] {m['title']} "
+                  f"({fmt_duration(m['duration'])}) | {m['video_id']} | {st}")
+        if len(missing) > 50:
+            print(f"... 외 {len(missing) - 50}개 (대시보드에서 전체 확인)")
+    log("[END] 스캔 완료 (다운로드 없음 - 조건을 정해 모드 1~3으로 받으세요)")
+    return summary
+
+
 # =============== 실패 재시도 / 예약 (모드 4) ===============
 
 def parse_selection(sel: str, total: int):
@@ -1608,14 +1723,23 @@ def _main_menu(db_conn):
     print("  3) 재생목록 자막 (전체 or 조건)")
     print(f"  4) 실패 목록 재시도/예약 (현재 실패 {failed_n}개)")
     print("  5) 예약 관리 (스케줄러 조회/삭제)")
+    print("  6) 스캔 (신규·자막없음 확인, 다운로드 없음)")
     print("=" * 55)
-    mode = input("모드 선택 (1/2/3/4/5): ").strip()
+    mode = input("모드 선택 (1/2/3/4/5/6): ").strip()
 
     if mode == "4":
         run_retry(db_conn)
         return
     if mode == "5":
         run_schedule_manager()
+        return
+    if mode == "6":
+        url = input("스캔할 채널/재생목록 URL: ").strip()
+        if not url:
+            log("[END] URL이 없어 종료")
+            return
+        vtype = ask_video_type()
+        run_scan(url, vtype, db_conn)
         return
 
     langs, auto_subs, sub_format, encoding = ask_lang_config()
