@@ -39,6 +39,7 @@ from subtitle_db import (
     db_latest_failed, db_count_by_status, db_last_success,
     db_cleanup_stale_running, normalize_scan_target, db_record_scan,
     db_latest_scan, db_scan_history, db_missing_subs, db_dashboard_data,
+    db_success_count,
 )
 
 # =============== 환경 설정 ===============
@@ -118,11 +119,14 @@ DEFAULT_CONFIG = {
     "fallback_langs": ["en"],
     "shorts_max_seconds": 60,
     "scan_interval_hours": 24,
+    "max_duplicate_downloads": 3,
 }
 
 STALE_RUNNING_MINUTES = 30  # running 흔적 정리 기준 (설정 파일로 변경 가능)
 
 SCAN_INTERVAL_HOURS = 24  # 스캔 주기 제안 기본값 (설정 파일로 변경 가능)
+
+MAX_DUP_DOWNLOADS = 3  # 같은 URL+언어 누적 성공 상한 (P5-4, 초과분은 요청 안 함)
 
 SHORTS_MAX_SECONDS = 60  # 길이 추정 기준: 이하면 숏폼 후보 (설정 파일로 변경 가능)
 
@@ -169,7 +173,8 @@ def apply_config(cfg):
     global DOWNLOAD_DIR, SUBTITLE_DIR, COOKIE_PATH, LOG_FILE, DB_PATH, LAST_DIR_FILE
     global SLEEP_BETWEEN_VIDEOS_MIN, SLEEP_BETWEEN_VIDEOS_MAX, SLEEP_ON_429_BASE
     global COOKIE_REFRESH_EVERY_N_VIDEOS, SLEEP_RETRY_MIN, SLEEP_RETRY_MAX
-    global MAX_CONSECUTIVE_429, STALE_RUNNING_MINUTES, SHORTS_MAX_SECONDS, SCAN_INTERVAL_HOURS, FALLBACK_LANGS
+    global MAX_CONSECUTIVE_429, STALE_RUNNING_MINUTES, SHORTS_MAX_SECONDS, SCAN_INTERVAL_HOURS
+    global MAX_DUP_DOWNLOADS, FALLBACK_LANGS
     DOWNLOAD_DIR = str(cfg.get("download_dir") or DEFAULT_CONFIG["download_dir"])
     SUBTITLE_DIR = os.path.join(DOWNLOAD_DIR, "subtitles")
     COOKIE_PATH = os.path.join(DOWNLOAD_DIR, COOKIE_FILENAME)
@@ -185,6 +190,8 @@ def apply_config(cfg):
     MAX_CONSECUTIVE_429 = _cfg_num(cfg, "max_consecutive_429", int)
     STALE_RUNNING_MINUTES = _cfg_num(cfg, "stale_running_minutes", int)
     SHORTS_MAX_SECONDS = _cfg_num(cfg, "shorts_max_seconds", int)
+    SCAN_INTERVAL_HOURS = _cfg_num(cfg, "scan_interval_hours", int)
+    MAX_DUP_DOWNLOADS = _cfg_num(cfg, "max_duplicate_downloads", int)
     fb = cfg.get("fallback_langs") or ["en"]
     fb = [str(l).strip() for l in fb] if isinstance(fb, (list, tuple)) else [str(fb)]
     FALLBACK_LANGS = tuple(l for l in fb if l) or ("en",)
@@ -762,9 +769,10 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
 
     DB에 시도 시작/종료(시각·제목·URL·결과)를 기록하고, 성공 시 자막 파일
     상단에 완료시각·제목·URL 헤더를 기입합니다.
-    반환: (result, saw_429) - result는 downloaded / skipped / failed / cached / no_subtitle.
+    반환: (result, saw_429) - result는 downloaded / skipped / failed / cached / duplicate / no_subtitle.
     cached는 DB에 같은 언어 완료 기록이 있고 파일도 그대로 있을 때
     (유튜브에 요청을 1번도 보내지 않음).
+    duplicate는 같은 URL+언어 누적 성공이 상한(MAX_DUP_DOWNLOADS)에 도달 (요청 없음).
     no_subtitle은 요청 언어→자동자막→영어 폴백까지 다 물어봤는데 자막이 없을 때.
     """
     outtmpl = build_sub_outtmpl(mode if mode in ("playlist", "channel", "single") else "single",
@@ -789,6 +797,18 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
                 CACHED_LIST.append(real_title)
                 return "cached", False
             log(f"[안내] 완료 기록은 있으나 파일이 없음 → 다시 받음: {started_title}")
+
+    # P5-4: 같은 URL+언어 누적 성공이 상한이면 더 받지 않음 (DB 카운트, 실패는 제외)
+    if db_conn is not None:
+        try:
+            dup_n = db_success_count(db_conn, url, langs_str)
+        except Exception as e:
+            log(f"[경고] DB 성공횟수 조회 실패: {e}")
+            dup_n = 0
+        if dup_n >= MAX_DUP_DOWNLOADS:
+            log(f"[SKIP] 중복 {dup_n}회(최대 {MAX_DUP_DOWNLOADS}회) → 재요청 안 함: {started_title}")
+            CACHED_LIST.append(started_title)
+            return "duplicate", False
 
     job_id = None
     if db_conn is not None:

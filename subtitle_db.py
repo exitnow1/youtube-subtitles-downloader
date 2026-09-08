@@ -155,6 +155,15 @@ def db_last_success(conn: sqlite3.Connection, url: str, langs_str: str):
     return None
 
 
+def db_success_count(conn: sqlite3.Connection, url: str, langs_str: str) -> int:
+    """같은 URL+언어의 누적 성공 횟수 (P5-4 중복 제한용, 실패는 세지 않음)."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM downloads WHERE url = ? AND langs = ? AND status = 'success'",
+        (url, langs_str),
+    ).fetchone()
+    return int(row["c"])
+
+
 def db_cleanup_stale_running(conn: sqlite3.Connection, older_than_minutes: int = 30) -> int:
     """시작된 지 오래된 running 행을 interrupted로 정리 (강제종료 흔적).
 
