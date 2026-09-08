@@ -338,3 +338,28 @@ def db_dashboard_data(conn: sqlite3.Connection):
                     "items": [dict(r) for r in items],
                     "history": [dict(r) for r in hist]})
     return out
+
+
+def db_channel_overview(conn: sqlite3.Connection, target_url: str):
+    """채널/재생목록 한 곳의 현황: 최신 스캔 항목 + 자막 상태 + 개수.
+
+    API 호출 없음 (DB만 읽음). 스캔 이력 없으면 None.
+    반환: {"target", "scan", "items", "total", "downloaded", "missing"}.
+    downloaded = 최신 success, missing = 그 외 전부.
+    """
+    latest = conn.execute(
+        "SELECT MAX(id) AS m FROM scans WHERE target_url = ?", (target_url,)).fetchone()["m"]
+    if not latest:
+        return None
+    scan = conn.execute("SELECT * FROM scans WHERE id = ?", (latest,)).fetchone()
+    items = conn.execute(
+        """SELECT si.video_id, si.title, si.duration, si.video_type, si.url, si.seen_at,
+                  (SELECT d.status FROM downloads d WHERE d.video_id = si.video_id
+                   ORDER BY d.id DESC LIMIT 1) AS dl_status
+           FROM scan_items si WHERE si.scan_id = ? ORDER BY si.id""",
+        (latest,)).fetchall()
+    items = [dict(r) for r in items]
+    downloaded = sum(1 for it in items if it.get("dl_status") == "success")
+    return {"target": target_url, "scan": dict(scan), "items": items,
+            "total": len(items), "downloaded": downloaded,
+            "missing": len(items) - downloaded}
