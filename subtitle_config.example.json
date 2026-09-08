@@ -10,5 +10,6 @@
   "stale_running_minutes": 30,
   "fallback_langs": ["en"],
   "shorts_max_seconds": 60,
-  "scan_interval_hours": 24
+  "scan_interval_hours": 24,
+  "max_duplicate_downloads": 3
 }
