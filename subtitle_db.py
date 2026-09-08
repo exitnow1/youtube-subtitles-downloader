@@ -301,3 +301,31 @@ def db_missing_subs(conn: sqlite3.Connection, target_url: str = None):
         params,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def db_dashboard_data(conn: sqlite3.Connection):
+    """대시보드용: 대상별 최신 스캔 + 항목별 자막 상태.
+
+    반환: [{target, scan, items, history}] — items 각 행에 dl_status 포함
+    (최신 downloads 상태, 없으면 None).
+    """
+    targets = conn.execute(
+        "SELECT target_url, MAX(id) AS scan_id FROM scans GROUP BY target_url ORDER BY scan_id DESC"
+    ).fetchall()
+    out = []
+    for t in targets:
+        scan = conn.execute("SELECT * FROM scans WHERE id = ?", (t["scan_id"],)).fetchone()
+        items = conn.execute(
+            """SELECT si.video_id, si.title, si.duration, si.video_type, si.url, si.seen_at,
+                      (SELECT d.status FROM downloads d WHERE d.video_id = si.video_id
+                       ORDER BY d.id DESC LIMIT 1) AS dl_status
+               FROM scan_items si WHERE si.scan_id = ? ORDER BY si.id""",
+            (t["scan_id"],)).fetchall()
+        hist = conn.execute(
+            """SELECT started_at, finished_at, total_count, new_count FROM scans
+               WHERE target_url = ? ORDER BY id DESC LIMIT 5""",
+            (t["target_url"],)).fetchall()
+        out.append({"target": t["target_url"], "scan": dict(scan),
+                    "items": [dict(r) for r in items],
+                    "history": [dict(r) for r in hist]})
+    return out
