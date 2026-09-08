@@ -1722,6 +1722,81 @@ def show_channel_list(db_conn, url=None, filters=None):
     return rows
 
 
+def run_download_missing(db_conn, langs=None, auto_subs=True, sub_format="vtt/best",
+                         encoding="utf-8"):
+    """모드 9: 미수신 영상만 골라 순차 다운로드.
+
+    순서: 대상 URL → 목록 필터(미수신 고정) → 순서(정방향/역순) →
+    다운로드 조건(날짜·길이) → 번호 선택(시작점) → 계획 확인 후 수동 시작.
+    자동 시작 없음. outtmpl은 채널=채널형, 그 외=개별형.
+    """
+    url = input("미수신을 받을 채널/재생목록 URL: ").strip()
+    if not url:
+        log("[END] URL이 없어 종료")
+        return
+    target = normalize_scan_target(url)
+    kind = "channel" if target.startswith("channel:") else "playlist"
+    filt = ask_list_filters()
+    filt["status"] = "missing"  # 이 흐름은 미수신 전용
+    rows = show_channel_list(db_conn, url, filt)
+    if not rows:
+        log("[안내] 받을 후보가 없습니다")
+        return
+    ans = input("순서 (Enter=목록 순서 / r=역순): ").strip().lower()
+    if ans == "r":
+        rows = list(reversed(rows))
+        log("[안내] 역순으로 진행합니다")
+    date_op, date_val, dmin, dmax, _, _ = ask_optional_filters(with_range=False)
+    try:
+        picked = parse_selection(
+            input(f"받을 번호 (예: all / 3-10 / 1,5, Enter=전체 {len(rows)}개): "), len(rows))
+    except ValueError:
+        log("선택 파싱 실패 → 취소 (숫자와 , - 만 사용)")
+        return
+    if not picked:
+        log("선택 없음 → 취소")
+        return
+    targets = [rows[i - 1] for i in picked]
+    mode = "channel" if kind == "channel" else "single"
+    print(f"\n======= 실행 계획: {len(targets)}개 ({'역순' if ans == 'r' else '정방향'}) =======")
+    for i, t in enumerate(targets[:5], 1):
+        print(f"{i}. {t.get('title')} | {t.get('video_id')}")
+    if len(targets) > 5:
+        print(f"... 외 {len(targets) - 5}개")
+        print(f"마지막: {targets[-1].get('title')} | {targets[-1].get('video_id')}")
+    go = input("위 순서대로 시작할까요? (y/N): ").strip().lower()
+    if go != "y":
+        log("[취소] 시작하지 않음 (아무것도 받지 않음)")
+        return
+
+    log(f"[START] 미수신 순차 다운로드: {len(targets)}개")
+    consec_429 = 0
+    done = 0
+    for n, t in enumerate(targets, 1):
+        vid_url = t.get("url") or f"https://www.youtube.com/watch?v={t.get('video_id')}"
+        log(f"[START] {n}/{len(targets)}: {t.get('title')} [{t.get('video_type')}]")
+        sub_filter = SubtitleFilter(date_op, date_val, dmin, dmax)
+        try:
+            result, saw_429 = download_subs_for_video(
+                vid_url, mode, sub_filter, langs, auto_subs, sub_format,
+                title_hint=t.get("title"), db_conn=db_conn, encoding=encoding,
+                entry_video_id=t.get("video_id"), entry_video_type=t.get("video_type"))
+        except KeyboardInterrupt:
+            log("[중단] 중단 (남은 항목은 미수신으로 남음)")
+            break
+        log(f"[END] {n}/{len(targets)}: {result}")
+        done += 1
+        consec_429 = consec_429 + 1 if saw_429 else 0
+        if consec_429 >= MAX_CONSECUTIVE_429:
+            log(f"[차단기] 429가 {MAX_CONSECUTIVE_429}회 연속 → 나머지 중단")
+            break
+        if n < len(targets):
+            _sleep_between_videos()
+            if done % COOKIE_REFRESH_EVERY_N_VIDEOS == 0:
+                export_cookies_from_chrome()
+    log(f"[END] 미수신 순차 다운로드 완료 ({done}/{len(targets)})")
+
+
 def finalize():
     if FAIL_LIST:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2032,8 +2107,9 @@ def _main_menu(db_conn):
     print("  6) 스캔 (신규·자막없음 확인, 다운로드 없음)")
     print("  7) 대시보드 만들기)")
     print("  8) 목록 보기 (DB만, API 호출 없음)")
+    print("  9) 미수신만 받기 (순서·범위 지정, 수동 시작)")
     print("=" * 55)
-    mode = input("모드 선택 (1/2/3/4/5/6/7/8): ").strip()
+    mode = input("모드 선택 (1/2/3/4/5/6/7/8/9): ").strip()
 
     if mode == "4":
         run_retry(db_conn)
@@ -2052,6 +2128,10 @@ def _main_menu(db_conn):
         url = input("목록 볼 채널/재생목록 URL (Enter=전체 현황): ").strip()
         show_channel_list(db_conn, url or None,
                           ask_list_filters() if url else None)
+        return
+    if mode == "9":
+        langs9, auto9, fmt9, enc9 = ask_lang_config()
+        run_download_missing(db_conn, langs9, auto9, fmt9, enc9)
         return
     if mode == "6":
         url = input("스캔할 채널/재생목록 URL: ").strip()
