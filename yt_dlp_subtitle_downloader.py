@@ -39,7 +39,7 @@ from subtitle_db import (
     db_latest_failed, db_count_by_status, db_last_success,
     db_cleanup_stale_running, normalize_scan_target, db_record_scan,
     db_latest_scan, db_scan_history, db_missing_subs, db_dashboard_data,
-    db_success_count,
+    db_success_count, db_channel_overview,
 )
 
 # =============== 환경 설정 ===============
@@ -1627,6 +1627,101 @@ def write_dashboard(db_conn, path=None) -> str:
     return path
 
 
+LIST_DISPLAY_LIMIT = 200  # 목록 화면 표시 상한 (개수는 전체 기준)
+
+
+def ask_list_filters():
+    """목록 필터 질문. 반환: dict(type, keyword, dur_min, dur_max, status)."""
+    vtype = ask_video_type()
+    keyword = input("제목 검색어 (Enter=전체): ").strip().lower()
+    dur_min_sec = dur_max_sec = None
+    ans = input("길이 조건 (예: 5-30분, Enter=전체): ").strip()
+    if ans:
+        try:
+            parts = ans.replace("분", "").split("-")
+            lo = parts[0].strip()
+            hi = parts[1].strip() if len(parts) > 1 else ""
+            if lo:
+                dur_min_sec = int(float(lo) * 60)
+            if hi:
+                dur_max_sec = int(float(hi) * 60)
+        except ValueError:
+            log("길이 조건 파싱 실패 → 전체")
+            dur_min_sec = dur_max_sec = None
+    st = input("상태 (Enter=전체 / y=받음만 / n=미수신만): ").strip().lower()
+    status = "downloaded" if st == "y" else ("missing" if st == "n" else "all")
+    return {"type": vtype, "keyword": keyword, "dur_min": dur_min_sec,
+            "dur_max": dur_max_sec, "status": status}
+
+
+def _match_list_filters(it, f):
+    """DB 행 1건이 목록 필터에 맞는지 (요청 없음, 로컬 판정)."""
+    if f["type"] != "both" and (it.get("video_type") or "long") != f["type"]:
+        return False
+    if f["keyword"] and f["keyword"] not in str(it.get("title") or "").lower():
+        return False
+    d = it.get("duration")
+    if f["dur_min"] is not None or f["dur_max"] is not None:
+        if d is None:
+            return False
+        try:
+            d = int(d)
+        except (TypeError, ValueError):
+            return False
+        if f["dur_min"] is not None and d < f["dur_min"]:
+            return False
+        if f["dur_max"] is not None and d > f["dur_max"]:
+            return False
+    is_done = it.get("dl_status") == "success"
+    if f["status"] == "downloaded" and not is_done:
+        return False
+    if f["status"] == "missing" and is_done:
+        return False
+    return True
+
+
+def show_channel_list(db_conn, url=None, filters=None):
+    """DB 기반 영상 목록 (API 호출 없음).
+
+    url이 없으면 전체 대상 요약표만. 있으면 항목 표 + 개수.
+    업로드 날짜는 목록 조회에 없어 표시 안 됨 (다운로드 시 조건으로 적용).
+    반환: 표시된 행 dict 목록 (P5-6 재사용).
+    """
+    if filters is None:
+        filters = {"type": "both", "keyword": "", "dur_min": None,
+                   "dur_max": None, "status": "all"}
+    if not url:
+        data = db_dashboard_data(db_conn)
+        if not data:
+            log("[안내] 스캔 기록이 없습니다. 모드 6으로 먼저 스캔하세요")
+            return []
+        print("\n======= 대상별 현황 (DB, API 호출 없음) =======")
+        for t in data:
+            done = sum(1 for it in t["items"] if it.get("dl_status") == "success")
+            print(f"- {t['target']} | 총 {len(t['items'])}개 | "
+                  f"받음 {done}개 | 미수신 {len(t['items']) - done}개 | "
+                  f"최근 {t['scan'].get('started_at', '')}")
+        return []
+    target = normalize_scan_target(url)
+    ov = db_channel_overview(db_conn, target)
+    if ov is None:
+        log(f"[안내] 스캔 기록 없음: {target} → 모드 6으로 먼저 스캔하세요")
+        return []
+    rows = [it for it in ov["items"] if _match_list_filters(it, filters)]
+    print(f"\n======= 목록: {target} (DB, API 호출 없음) =======")
+    print(f"총 {ov['total']}개 | 받음 {ov['downloaded']}개 | "
+          f"미수신 {ov['missing']}개 | 스캔 {ov['scan'].get('started_at', '')}")
+    print("(업로드 날짜는 목록에 없어 표시 안 됨. 날짜 조건은 다운로드 시 적용)")
+    for i, it in enumerate(rows[:LIST_DISPLAY_LIMIT], 1):
+        mark = "[받음]" if it.get("dl_status") == "success" else f"[미수신:{it.get('dl_status') or '미시도'}]"
+        typ = "숏폼" if it.get("video_type") == "shorts" else "롱폼"
+        print(f"{i}. {mark} [{typ}] {it.get('title')} "
+              f"({fmt_duration(it.get('duration'))}) | {it.get('video_id')}")
+    if len(rows) > LIST_DISPLAY_LIMIT:
+        print(f"... 외 {len(rows) - LIST_DISPLAY_LIMIT}개 (필터로 좁히세요)")
+    return rows
+
+
 def finalize():
     if FAIL_LIST:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1936,8 +2031,9 @@ def _main_menu(db_conn):
     print("  5) 예약 관리 (스케줄러 조회/삭제)")
     print("  6) 스캔 (신규·자막없음 확인, 다운로드 없음)")
     print("  7) 대시보드 만들기)")
+    print("  8) 목록 보기 (DB만, API 호출 없음)")
     print("=" * 55)
-    mode = input("모드 선택 (1/2/3/4/5/6/7): ").strip()
+    mode = input("모드 선택 (1/2/3/4/5/6/7/8): ").strip()
 
     if mode == "4":
         run_retry(db_conn)
@@ -1951,6 +2047,11 @@ def _main_menu(db_conn):
             print(f"대시보드: {path} (브라우저로 여세요)")
         except Exception as e:
             log(f"[경고] 대시보드 생성 실패: {e}")
+        return
+    if mode == "8":
+        url = input("목록 볼 채널/재생목록 URL (Enter=전체 현황): ").strip()
+        show_channel_list(db_conn, url or None,
+                          ask_list_filters() if url else None)
         return
     if mode == "6":
         url = input("스캔할 채널/재생목록 URL: ").strip()
