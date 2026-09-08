@@ -24,6 +24,7 @@ import re
 import sys
 import time
 import json
+import html
 import random
 import argparse
 import subprocess
@@ -37,7 +38,7 @@ from subtitle_db import (
     db_init, db_record_start, db_record_finish,
     db_latest_failed, db_count_by_status, db_last_success,
     db_cleanup_stale_running, normalize_scan_target, db_record_scan,
-    db_latest_scan, db_scan_history, db_missing_subs,
+    db_latest_scan, db_scan_history, db_missing_subs, db_dashboard_data,
 )
 
 # =============== 환경 설정 ===============
@@ -116,9 +117,12 @@ DEFAULT_CONFIG = {
     "stale_running_minutes": 30,
     "fallback_langs": ["en"],
     "shorts_max_seconds": 60,
+    "scan_interval_hours": 24,
 }
 
 STALE_RUNNING_MINUTES = 30  # running 흔적 정리 기준 (설정 파일로 변경 가능)
+
+SCAN_INTERVAL_HOURS = 24  # 스캔 주기 제안 기본값 (설정 파일로 변경 가능)
 
 SHORTS_MAX_SECONDS = 60  # 길이 추정 기준: 이하면 숏폼 후보 (설정 파일로 변경 가능)
 
@@ -165,7 +169,7 @@ def apply_config(cfg):
     global DOWNLOAD_DIR, SUBTITLE_DIR, COOKIE_PATH, LOG_FILE, DB_PATH, LAST_DIR_FILE
     global SLEEP_BETWEEN_VIDEOS_MIN, SLEEP_BETWEEN_VIDEOS_MAX, SLEEP_ON_429_BASE
     global COOKIE_REFRESH_EVERY_N_VIDEOS, SLEEP_RETRY_MIN, SLEEP_RETRY_MAX
-    global MAX_CONSECUTIVE_429, STALE_RUNNING_MINUTES, SHORTS_MAX_SECONDS, FALLBACK_LANGS
+    global MAX_CONSECUTIVE_429, STALE_RUNNING_MINUTES, SHORTS_MAX_SECONDS, SCAN_INTERVAL_HOURS, FALLBACK_LANGS
     DOWNLOAD_DIR = str(cfg.get("download_dir") or DEFAULT_CONFIG["download_dir"])
     SUBTITLE_DIR = os.path.join(DOWNLOAD_DIR, "subtitles")
     COOKIE_PATH = os.path.join(DOWNLOAD_DIR, COOKIE_FILENAME)
@@ -1336,7 +1340,7 @@ def list_retry_tasks():
         if not line:
             continue
         name = line.split('","')[0].strip().strip('"').lstrip("\\")
-        if name.startswith(SCHED_PREFIX):
+        if name.startswith(SCHED_PREFIX) or name.startswith(SCHED_SCAN_PREFIX):
             tasks.append(name)
     return tasks
 
@@ -1352,6 +1356,75 @@ def delete_retry_task(task_name):
         return True, f"예약 삭제 완료: {task_name}"
     out = (proc.stderr or proc.stdout or "").strip()[:200]
     return False, f"예약 삭제 실패: {out}"
+
+
+SCHED_SCAN_PREFIX = "YTSubsScan_"
+
+
+def build_scan_command(url: str, video_type: str) -> str:
+    """스캔 예약이 실행할 명령줄 문자열."""
+    return (f'"{sys.executable}" "{os.path.abspath(__file__)}" '
+            f'--scan "{url}" --scan-type {video_type} --headless')
+
+
+def parse_cadence(raw: str, default_hours: int):
+    """주기 입력 파싱 → ("daily", "HH:MM") 또는 ("hourly", N).
+
+    예: "" → 매 default_hours시간 / "daily 09:00" / "6h" / "09:00".
+    """
+    s = (raw or "").strip().lower()
+    if not s:
+        return ("hourly", int(default_hours or 24))
+    m = re.match(r"^daily\s+(\d{1,2}):(\d{2})$", s)
+    if m:
+        return ("daily", f"{int(m.group(1)):02d}:{m.group(2)}")
+    m = re.match(r"^(\d+)\s*h$", s)
+    if m:
+        return ("hourly", max(1, int(m.group(1))))
+    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+    if m:
+        return ("daily", f"{int(m.group(1)):02d}:{m.group(2)}")
+    log(f"[경고] 주기 형식 오류 → {default_hours}시간마다로 설정 (예: daily 09:00 / 6h)")
+    return ("hourly", int(default_hours or 24))
+
+
+def register_scan_task(url: str, video_type: str, cadence):
+    """스캔 주기 예약 등록. 반환: (성공여부, 안내문)."""
+    kind, val = cadence
+    if kind == "daily":
+        task_name = f"{SCHED_SCAN_PREFIX}daily_{val.replace(':', '')}"
+        args = ["schtasks", "/create", "/tn", task_name,
+                "/tr", build_scan_command(url, video_type),
+                "/sc", "daily", "/st", val, "/f"]
+        when = f"매일 {val}"
+    else:
+        task_name = f"{SCHED_SCAN_PREFIX}h{val}"
+        args = ["schtasks", "/create", "/tn", task_name,
+                "/tr", build_scan_command(url, video_type),
+                "/sc", "hourly", "/mo", str(val), "/f"]
+        when = f"{val}시간마다"
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return False, "schtasks를 찾을 수 없음 (Windows 전용 기능)"
+    except Exception as e:
+        return False, f"스캔 예약 실패: {e}"
+    if proc.returncode == 0:
+        return True, f"스캔 예약 완료: {task_name} ({when} 실행, {url})"
+    out = (proc.stderr or proc.stdout or "").strip()[:300]
+    return False, f"스캔 예약 실패: {out}"
+
+
+def ask_scan_schedule(url: str, video_type: str):
+    """스캔 주기 등록 제안. 등록하면 True."""
+    ans = input("이 스캔을 주기적으로 자동 실행할까요? (y/N): ").strip().lower()
+    if ans != "y":
+        return False
+    raw = input(f"주기 (예: daily 09:00 / 6h, Enter={SCAN_INTERVAL_HOURS}시간마다): ").strip()
+    cadence = parse_cadence(raw, SCAN_INTERVAL_HOURS)
+    ok, msg = register_scan_task(url, video_type, cadence)
+    log(msg)
+    return ok
 
 
 def run_schedule_manager():
@@ -1454,6 +1527,85 @@ def run_retry(db_conn):
 
 
 # =============== 종료 정리 ===============
+
+def status_badge(dl_status):
+    """자막 상태 → (표시문, 색상). 없음은 빨강 (미시도·no_subtitle·중단 포함)."""
+    if dl_status == "success":
+        return ("있음", "#1a7f37")
+    if dl_status == "failed":
+        return ("실패", "#9a6700")
+    if dl_status == "skipped":
+        return ("스킵", "#57606a")
+    return ("없음", "#cf222e")
+
+
+def build_dashboard_html(targets, generated_at: str) -> str:
+    """대시보드 HTML 한 장 (인라인 CSS + 제목/상태 필터 JS)."""
+    total_videos = sum(len(t["items"]) for t in targets)
+    total_with = sum(1 for t in targets for it in t["items"] if it.get("dl_status") == "success")
+    parts = []
+    parts.append("<!DOCTYPE html><html lang=\"ko\"><head><meta charset=\"utf-8\">"
+                 "<title>자막 대시보드</title><style>"
+                 "body{font-family:sans-serif;max-width:1100px;margin:24px auto;padding:0 16px}"
+                 "table{border-collapse:collapse;width:100%;margin:12px 0}"
+                 "th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}"
+                 "th{background:#f0f0f0}.badge{color:#fff;border-radius:10px;padding:2px 10px;font-size:12px}"
+                 ".card{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:16px 0}"
+                 ".controls{margin:12px 0}</style></head><body>")
+    parts.append(f"<h1>자막 대시보드</h1><p>생성: {html.escape(generated_at)} | "
+                 f"대상 {len(targets)}곳 | 영상 {total_videos}개 | 자막있음 {total_with}개</p>")
+    parts.append("<div class=\"controls\"><input id=\"q\" placeholder=\"제목 검색...\"> "
+                 "<select id=\"st\"><option value=\"\">전체 상태</option>"
+                 "<option>있음</option><option>없음</option><option>실패</option>"
+                 "<option>스킵</option></select></div>")
+    for t in targets:
+        sc = t["scan"]
+        parts.append("<div class=\"card\">"
+                     f"<h2>{html.escape(t['target'])}</h2>"
+                     f"<p>최근 스캔: {html.escape(str(sc.get('started_at', '')))} | "
+                     f"전체 {sc.get('total_count', 0)}개 | 신규 {sc.get('new_count', 0)}개</p>")
+        parts.append("<table><tr><th>#</th><th>제목</th><th>길이</th><th>종류</th><th>자막</th></tr>")
+        for i, it in enumerate(t["items"], 1):
+            label, color = status_badge(it.get("dl_status"))
+            title = html.escape(str(it.get("title") or ""), quote=True)
+            url = html.escape(str(it.get("url") or ""), quote=True)
+            dur = html.escape(fmt_duration(it.get("duration")))
+            typ = "숏폼" if it.get("video_type") == "shorts" else "롱폼"
+            parts.append(
+                f"<tr data-t=\"{title}\" data-s=\"{label}\"><td>{i}</td>"
+                f"<td><a href=\"{url}\">{title}</a></td><td>{dur}</td><td>{typ}</td>"
+                f"<td><span class=\"badge\" style=\"background:{color}\">{label}</span></td></tr>")
+        parts.append("</table>")
+        if t["history"]:
+            parts.append("<p>최근 스캔: " + ", ".join(
+                f"{html.escape(str(h.get('started_at', '')))} "
+                f"(전체 {h.get('total_count', 0)}/신규 {h.get('new_count', 0)})"
+                for h in t["history"]) + "</p>")
+        parts.append("</div>")
+    parts.append("<script>function f(){var q=document.getElementById('q').value.toLowerCase();"
+                 "var st=document.getElementById('st').value;"
+                 "document.querySelectorAll('tr[data-t]').forEach(function(tr){"
+                 "var okT=!st||tr.getAttribute('data-s')===st;"
+                 "var okQ=!q||tr.getAttribute('data-t').toLowerCase().includes(q);"
+                 "tr.style.display=(okT&&okQ)?'':'none';});}"
+                 "document.getElementById('q').addEventListener('input',f);"
+                 "document.getElementById('st').addEventListener('change',f);</script>")
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def write_dashboard(db_conn, path=None) -> str:
+    """DB → dashboard.html 생성. 반환: 저장 경로."""
+    if path is None:
+        ensure_dirs()
+        path = os.path.join(DOWNLOAD_DIR, "dashboard.html")
+    data = db_dashboard_data(db_conn)
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(build_dashboard_html(data, generated))
+    log(f"대시보드 생성 → {path} (대상 {len(data)}곳)")
+    return path
+
 
 def finalize():
     if FAIL_LIST:
@@ -1628,7 +1780,31 @@ def parse_cli(argv=None):
                    help='실패 목록 재시도 (무질문). 예: --retry-failed / --retry-failed "1,3-5"')
     p.add_argument("--retry-select", default=None, help="재시도 선택 (예: 1,3-5)")
     p.add_argument("--headless", action="store_true", help="알림 팝업 생략")
+    p.add_argument("--scan", default=None, help="스캔만 실행 (URL, 무질문)")
+    p.add_argument("--scan-type", default="long", help="long|shorts|both (기본 long)")
+    p.add_argument("--dashboard", action="store_true", help="대시보드만 생성")
     return p.parse_known_args(argv)[0]
+
+
+def run_headless_scan(url: str, video_type: str = "long"):
+    """--scan 용: 질문 없이 스캔 + 대시보드 갱신 (스케줄러가 호출)."""
+    global SUBTITLE_DIR
+    SUBTITLE_DIR = _load_last_save_dir() or SUBTITLE_DIR
+    ensure_dirs()
+    log(f"[START] 무질문 스캔: {url} ({video_type})")
+    conn = db_init(DB_PATH)
+    try:
+        run_scan(url, video_type, conn)
+        try:
+            write_dashboard(conn)
+        except Exception as e:
+            log(f"[경고] 대시보드 생성 실패: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    log("[END] 무질문 스캔 완료")
 
 
 def run_headless_retry(selection_raw="all"):
@@ -1680,7 +1856,22 @@ def main():
     apply_config(load_config())  # 설정 파일 우선 적용 (없으면 기본값으로 생성)
     log(f"설정 파일: {CONFIG_PATH}")
     args = parse_cli()
-    HEADLESS = bool(args.headless or args.retry_failed is not None)
+    HEADLESS = bool(args.headless or args.retry_failed is not None or args.scan is not None
+                    or args.dashboard)
+    if args.scan is not None:
+        run_headless_scan(args.scan, args.scan_type or "long")
+        return
+    if args.dashboard:
+        ensure_dirs()
+        conn = db_init(DB_PATH)
+        try:
+            write_dashboard(conn)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return
     if args.retry_failed is not None:
         run_headless_retry(args.retry_select or args.retry_failed)
         return
@@ -1724,14 +1915,22 @@ def _main_menu(db_conn):
     print(f"  4) 실패 목록 재시도/예약 (현재 실패 {failed_n}개)")
     print("  5) 예약 관리 (스케줄러 조회/삭제)")
     print("  6) 스캔 (신규·자막없음 확인, 다운로드 없음)")
+    print("  7) 대시보드 만들기)")
     print("=" * 55)
-    mode = input("모드 선택 (1/2/3/4/5/6): ").strip()
+    mode = input("모드 선택 (1/2/3/4/5/6/7): ").strip()
 
     if mode == "4":
         run_retry(db_conn)
         return
     if mode == "5":
         run_schedule_manager()
+        return
+    if mode == "7":
+        try:
+            path = write_dashboard(db_conn)
+            print(f"대시보드: {path} (브라우저로 여세요)")
+        except Exception as e:
+            log(f"[경고] 대시보드 생성 실패: {e}")
         return
     if mode == "6":
         url = input("스캔할 채널/재생목록 URL: ").strip()
@@ -1740,6 +1939,11 @@ def _main_menu(db_conn):
             return
         vtype = ask_video_type()
         run_scan(url, vtype, db_conn)
+        ask_scan_schedule(url, vtype)
+        try:
+            write_dashboard(db_conn)
+        except Exception as e:
+            log(f"[경고] 대시보드 생성 실패: {e}")
         return
 
     langs, auto_subs, sub_format, encoding = ask_lang_config()
