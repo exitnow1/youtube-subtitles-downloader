@@ -1,3 +1,20 @@
+# YouTube Downloader
+
+> **에이전트(스킬)로 쓰는 법**: `skills/yt-subs-downloader/SKILL.md` 스킬을 로드하면
+> 자막 다운로더의 전 기능(채널·재생목록·개별·스캔·재시도·예약·대시보드)을
+> 명령줄로 호출할 수 있습니다. 상세 전체 안내는 `SUBTITLE_GUIDE.md`.
+>
+> ```powershell
+> # 예시: 채널 자막 배치 + 결과 JSON
+> python yt_dlp_subtitle_downloader.py --channel "https://www.youtube.com/@handle" --type both --json
+> # 예시: 미수신만 순서대로 (확인 후 시작)
+> python yt_dlp_subtitle_downloader.py --missing "https://www.youtube.com/@handle" --order desc --select "1-10" --yes --json
+> ```
+>
+> 스킬 설치: 이 저장소의 `skills/yt-subs-downloader/` 폴더를
+> `C:\Users\rpt53\.agents\skills\` 아래에 복사하면 opencode·Codex가 자동 인식합니다
+> (이 저장소에도 함께 커밋되어 있음).
+
 # YouTube Downloader (yt-dlp 20분 분할)
 
 유튜브 영상/재생목록을 20분 단위로 자동 분할 다운로드하는 `yt-dlp` 기반 Python 도구. 차단 방지(Sleep/Jitter, 429 백오프, 쿠키 원자적 교체) 및 차세대 안정성 패치 적용.
