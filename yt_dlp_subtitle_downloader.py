@@ -1781,13 +1781,7 @@ def ask_list_filters():
     ans = input("길이 조건 (예: 5-30분, Enter=전체): ").strip()
     if ans:
         try:
-            parts = ans.replace("분", "").split("-")
-            lo = parts[0].strip()
-            hi = parts[1].strip() if len(parts) > 1 else ""
-            if lo:
-                dur_min_sec = int(float(lo) * 60)
-            if hi:
-                dur_max_sec = int(float(hi) * 60)
+            dur_min_sec, dur_max_sec = parse_dur_filter(ans)
         except ValueError:
             log("길이 조건 파싱 실패 → 전체")
             dur_min_sec = dur_max_sec = None
@@ -1912,6 +1906,14 @@ def run_download_missing(db_conn, langs=None, auto_subs=True, sub_format="vtt/be
         log("[취소] 시작하지 않음 (아무것도 받지 않음)")
         return
 
+    _run_missing_targets(db_conn, targets, mode, date_op, date_val, dmin, dmax,
+                         langs, auto_subs, sub_format, encoding)
+
+
+def _run_missing_targets(db_conn, targets, mode, date_op=None, date_val=None,
+                         dmin=None, dmax=None, langs=None, auto_subs=True,
+                         sub_format="vtt/best", encoding="utf-8"):
+    """미수신 실행 본체 (대화형/무질문 공용). 확인은 호출부 책임."""
     log(f"[START] 미수신 순차 다운로드: {len(targets)}개")
     run_id = _run_begin(db_conn, "missing", f"{len(targets)}건")
     before = _counters()
@@ -1945,6 +1947,7 @@ def run_download_missing(db_conn, langs=None, auto_subs=True, sub_format="vtt/be
 
 
 def finalize():
+    fail_path = None
     if FAIL_LIST:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ensure_dirs()
@@ -1984,12 +1987,31 @@ def finalize():
     except Exception:
         pass
     if HEADLESS:
-        return  # 스케줄러 실행 중 팝업 금지 (멈춤 방지)
-    try:
-        from ctypes import windll
-        windll.user32.MessageBoxW(0, "자막 다운로드 작업이 종료되었습니다.", "subtitle downloader", 0)
-    except Exception:
-        pass
+        pass  # 스케줄러 실행 중 팝업 금지 (멈춤 방지)
+    else:
+        try:
+            from ctypes import windll
+            windll.user32.MessageBoxW(0, "자막 다운로드 작업이 종료되었습니다.", "subtitle downloader", 0)
+        except Exception:
+            pass
+    return {"success": len(SUCCESS_LIST), "cached": len(CACHED_LIST),
+            "no_subtitle": len(NO_SUB_LIST), "skipped": len(SKIPPED_LIST),
+            "failed": len(FAIL_LIST), "fail_file": fail_path,
+            "db": DB_PATH, "log": LOG_FILE}
+
+
+JSON_MODE = False  # True면 마지막에 SUMMARY_JSON 1줄 출력 (--json, 에이전트용)
+
+
+def _print_json_summary(extra=None):
+    """기계 판독용 요약 1줄. extra dict를 결과에 합침."""
+    import json as _json
+    summary = {"success": len(SUCCESS_LIST), "cached": len(CACHED_LIST),
+               "no_subtitle": len(NO_SUB_LIST), "skipped": len(SKIPPED_LIST),
+               "failed": len(FAIL_LIST)}
+    if extra:
+        summary.update(extra)
+    print("SUMMARY_JSON: " + _json.dumps(summary, ensure_ascii=False))
 
 
 # =============== 입력 도우미 ===============
@@ -2028,22 +2050,84 @@ def ask_save_location():
     return chosen
 
 
+def parse_langs(raw) -> list:
+    """언어 문자열 → 리스트. ""→기본값. 대화형·CLI 공용."""
+    s = (raw or "").strip()
+    if not s:
+        return ["ko", "en"]
+    if s.lower() == "all":
+        return ["all"]
+    return [p.strip() for p in s.split(",") if p.strip()] or ["ko", "en"]
+
+
+def parse_auto(raw) -> bool:
+    """'n' → False, 나머지(빈값 포함) → True. 대화형·CLI 공용."""
+    return (raw or "").strip().lower() != "n"
+
+
+def parse_sub_format(raw) -> str:
+    """'srt' → srt 우선, 나머지 → vtt 우선. 대화형·CLI 공용."""
+    return "srt/vtt/best" if (raw or "").strip().lower() == "srt" else "vtt/best"
+
+
+def parse_video_type(raw) -> str:
+    """long/shorts/both 정규화. 모르면 long. 대화형·CLI 공용."""
+    s = (raw or "").strip().lower()
+    if s in ("shorts", "short", "숏폼", "숏"):
+        return "shorts"
+    if s in ("both", "all", "둘다", "둘 다", "모두"):
+        return "both"
+    return "long"
+
+
+def parse_date_filter(raw):
+    """날짜 조건 문자열 → (op, YYYYMMDD). 빈값 → (None, None). 오류 시 ValueError."""
+    s = (raw or "").strip()
+    if not s:
+        return None, None
+    m = re.match(r"\s*(==|=|!=|<=|>=|<|>)\s*(.+)\s*$", s)
+    if not m:
+        raise ValueError("연산자(==,!=,<,<=,>,>=)로 시작해야 합니다")
+    return DATE_OPS[m.group(1)], parse_ymd(m.group(2))
+
+
+def parse_dur_filter(raw):
+    """길이 조건 문자열(분) → (최소초, 최대초). 빈값 → (None, None). 오류 시 ValueError."""
+    s = (raw or "").strip()
+    if not s:
+        return None, None
+    parts = s.replace("분", "").split("-")
+    lo = parts[0].strip()
+    hi = parts[1].strip() if len(parts) > 1 else ""
+    try:
+        dmin = int(float(lo) * 60) if lo else None
+        dmax = int(float(hi) * 60) if hi else None
+    except ValueError:
+        raise ValueError(f"길이 형식 오류: {raw} (예: 5-30분)")
+    return dmin, dmax
+
+
+def parse_range_filter(raw):
+    """번호 범위 문자열 → (시작, 끝). 빈값 → (None, None). 오류 시 ValueError."""
+    s = (raw or "").strip()
+    if not s:
+        return None, None
+    parts = s.split("-")
+    try:
+        start_idx = int(parts[0].strip())
+        end_idx = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip() else None
+    except ValueError:
+        raise ValueError(f"범위 형식 오류: {raw} (예: 1-50)")
+    if start_idx < 1:
+        raise ValueError("start < 1")
+    return start_idx, end_idx
+
+
 def ask_lang_config():
     """자막 언어/자동자막/형식/인코딩 묻기."""
-    langs_raw = input("자막 언어 (쉼표 구분, 예: ko,en / 전체는 all, Enter=ko,en): ").strip()
-    if not langs_raw:
-        langs = ["ko", "en"]
-    elif langs_raw.lower() == "all":
-        langs = ["all"]
-    else:
-        langs = [p.strip() for p in langs_raw.split(",") if p.strip()] or ["ko", "en"]
-    auto_raw = input("자동생성 자막도 포함? (Y/n, Enter=Y): ").strip().lower()
-    auto_subs = auto_raw != "n"
-    fmt_raw = input("형식 (vtt/srt, Enter=vtt): ").strip().lower()
-    if fmt_raw == "srt":
-        sub_format = "srt/vtt/best"
-    else:
-        sub_format = "vtt/best"
+    langs = parse_langs(input("자막 언어 (쉼표 구분, 예: ko,en / 전체는 all, Enter=ko,en): "))
+    auto_subs = parse_auto(input("자동생성 자막도 포함? (Y/n, Enter=Y): "))
+    sub_format = parse_sub_format(input("형식 (vtt/srt, Enter=vtt): "))
     enc_raw = input("인코딩 (Enter=UTF-8 / bom=한글TV용 / cp949=구형기기용): ").strip()
     encoding = normalize_encoding(enc_raw)
     log(f"자막 설정: 언어={langs}, 자동자막={'포함' if auto_subs else '제외'}, 형식={sub_format}, 인코딩={encoding}")
@@ -2052,12 +2136,7 @@ def ask_lang_config():
 
 def ask_video_type():
     """롱폼/숏폼 선택. Enter=롱폼만 (기존 동작 유지)."""
-    ans = input("종류 (Enter=롱폼만 / shorts=숏폼만 / both=둘 다): ").strip().lower()
-    if ans in ("shorts", "short", "숏폼", "숏"):
-        return "shorts"
-    if ans in ("both", "all", "둘다", "둘 다", "모두"):
-        return "both"
-    return "long"
+    return parse_video_type(input("종류 (Enter=롱폼만 / shorts=숏폼만 / both=둘 다): "))
 
 
 def ask_manual_urls():
@@ -2083,45 +2162,31 @@ def ask_manual_urls():
 def ask_optional_filters(with_range=True):
     """날짜/길이/번호 조건 묻기 (전부 Enter면 조건 없음)."""
     date_op = date_val = None
-    ans = input("업로드 날짜 조건을 쓸까요? (예: >= 2024-01-01, 아니면 Enter): ").strip()
-    if ans:
+    ans = input("업로드 날짜 조건을 쓸까요? (예: >= 2024-01-01, 아니면 Enter): ")
+    if ans.strip():
         try:
-            m = re.match(r"\s*(==|=|!=|<=|>=|<|>)\s*(.+)\s*$", ans)
-            if not m:
-                raise ValueError("연산자(==,!=,<,<=,>,>=)로 시작해야 합니다")
-            date_op = DATE_OPS[m.group(1)]
-            date_val = parse_ymd(m.group(2))
+            date_op, date_val = parse_date_filter(ans)
             log(f"날짜 조건: upload_date {date_op} {date_val}")
         except ValueError as ve:
             log(f"날짜 조건 파싱 실패 → 날짜 조건 없이 진행 ({ve})")
             date_op = date_val = None
 
     dur_min_sec = dur_max_sec = None
-    ans = input("길이 조건을 쓸까요? (예: 5-30분, 최소만은 10-, 아니면 Enter): ").strip()
-    if ans:
+    ans = input("길이 조건을 쓸까요? (예: 5-30분, 최소만은 10-, 아니면 Enter): ")
+    if ans.strip():
         try:
-            parts = ans.replace("분", "").split("-")
-            lo = parts[0].strip()
-            hi = parts[1].strip() if len(parts) > 1 else ""
-            if lo:
-                dur_min_sec = int(float(lo) * 60)
-            if hi:
-                dur_max_sec = int(float(hi) * 60)
-            log(f"길이 조건: {lo or '제한없음'}분 ~ {hi or '제한없음'}분")
+            dur_min_sec, dur_max_sec = parse_dur_filter(ans)
+            log(f"길이 조건: {ans.strip()}")
         except ValueError:
             log("길이 조건 파싱 실패 → 길이 조건 없이 진행")
             dur_min_sec = dur_max_sec = None
 
     start_idx = end_idx = None
     if with_range:
-        ans = input("번호 범위를 지정할까요? (예: 1-50, 아니면 Enter=전체): ").strip()
-        if ans:
+        ans = input("번호 범위를 지정할까요? (예: 1-50, 아니면 Enter=전체): ")
+        if ans.strip():
             try:
-                parts = ans.split("-")
-                start_idx = int(parts[0].strip())
-                end_idx = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip() else None
-                if start_idx < 1:
-                    raise ValueError("start < 1")
+                start_idx, end_idx = parse_range_filter(ans)
             except ValueError:
                 log("범위 파싱 실패 → 전체 처리")
                 start_idx = end_idx = None
@@ -2131,7 +2196,7 @@ def ask_optional_filters(with_range=True):
 # =============== 메인 ===============
 
 def parse_cli(argv=None):
-    """명령줄 인자. --retry-failed는 스케줄러용 무질문 실행."""
+    """명령줄 인자. 대화형 질문과 같은 문자열을 그대로 받음."""
     p = argparse.ArgumentParser(description="YouTube 자막 배치 다운로더")
     p.add_argument("--retry-failed", nargs="?", const="all", default=None,
                    help='실패 목록 재시도 (무질문). 예: --retry-failed / --retry-failed "1,3-5"')
@@ -2140,7 +2205,190 @@ def parse_cli(argv=None):
     p.add_argument("--scan", default=None, help="스캔만 실행 (URL, 무질문)")
     p.add_argument("--scan-type", default="long", help="long|shorts|both (기본 long)")
     p.add_argument("--dashboard", action="store_true", help="대시보드만 생성")
+    p.add_argument("--channel", default=None, help="채널 자막 (URL)")
+    p.add_argument("--playlist", default=None, help="재생목록 자막 (URL)")
+    p.add_argument("--single", nargs="+", default=None, help="개별 영상 자막 (URL 1개 이상)")
+    p.add_argument("--list", default=None, help="목록 보기 (URL, DB만)")
+    p.add_argument("--missing", default=None, help="미수신만 받기 (URL)")
+    p.add_argument("--type", default="", help="long|shorts|both (기본 long)")
+    p.add_argument("--langs", default="", help="자막 언어 (예: ko,en / all, 기본 ko,en)")
+    p.add_argument("--no-auto", action="store_true", help="자동생성 자막 제외")
+    p.add_argument("--format", default="", help="vtt|srt (기본 vtt)")
+    p.add_argument("--encoding", default="", help="utf-8|bom|cp949 (기본 utf-8)")
+    p.add_argument("--out", default="", help="저장 폴더 (기본값: 지난번/기본)")
+    p.add_argument("--date", default="", help='날짜 조건 (예: ">= 2024-01-01")')
+    p.add_argument("--dur", default="", help="길이 조건 분 (예: 5-30)")
+    p.add_argument("--range", default="", help="번호 범위 (예: 1-50)")
+    p.add_argument("--keyword", default="", help="목록 제목 검색어")
+    p.add_argument("--status", default="all", help="목록 상태: all|downloaded|missing")
+    p.add_argument("--order", default="asc", help="미수신 순서: asc|desc")
+    p.add_argument("--select", default="all", help="미수신 선택 (예: all / 3-10)")
+    p.add_argument("--yes", action="store_true", help="확인 없이 시작 (미수신)")
+    p.add_argument("--json", action="store_true", help="마지막에 SUMMARY_JSON 1줄 출력")
     return p.parse_known_args(argv)[0]
+
+
+JSON_MODE = False  # --json: 마지막에 SUMMARY_JSON 1줄 (에이전트용)
+
+
+def run_headless_flow(args):
+    """--channel/--playlist/--single/--list/--missing 무질문 실행 + 요약."""
+    langs, auto_subs, sub_format, encoding, vtype, date_op, date_val, dmin, dmax, s, e = _cli_common(args)
+    conn = db_init(DB_PATH)
+    try:
+        try:
+            cleaned = db_cleanup_stale_running(conn, STALE_RUNNING_MINUTES)
+        except Exception:
+            cleaned = 0
+        if cleaned:
+            log(f"[정리] running 흔적 {cleaned}건 정리")
+        summary = {}
+        if args.channel:
+            log(f"[START] 무질문 채널: {args.channel}")
+            run_headless_batch(conn, "channel", args.channel, None, args,
+                               langs, auto_subs, sub_format, encoding, vtype,
+                               date_op, date_val, dmin, dmax, s, e)
+            summary = {"mode": "channel", "url": args.channel}
+        elif args.playlist:
+            log(f"[START] 무질문 재생목록: {args.playlist}")
+            run_headless_batch(conn, "playlist", args.playlist, None, args,
+                               langs, auto_subs, sub_format, encoding, vtype,
+                               date_op, date_val, dmin, dmax, s, e)
+            summary = {"mode": "playlist", "url": args.playlist}
+        elif args.single:
+            log(f"[START] 무질문 개별: {len(args.single)}개")
+            run_headless_batch(conn, "single", None, args.single, args,
+                               langs, auto_subs, sub_format, encoding, vtype,
+                               date_op, date_val, dmin, dmax, s, e)
+            summary = {"mode": "single", "count": len(args.single)}
+        elif args.list:
+            rows = run_headless_list(conn, args.list, args)
+            summary = {"mode": "list", "url": args.list, "count": len(rows),
+                       "rows": [{"video_id": r.get("video_id"), "title": r.get("title"),
+                                 "duration": r.get("duration"), "video_type": r.get("video_type"),
+                                 "url": r.get("url"),
+                                 "downloaded": r.get("dl_status") == "success"} for r in rows]}
+        elif args.missing:
+            if not args.yes:
+                log("[안내] 무질문 미수신은 --yes 필요 (확인 없이 시작 방지)")
+                return
+            run_headless_missing(conn, args.missing, args, langs, auto_subs, sub_format,
+                                 encoding, date_op, date_val, dmin, dmax)
+            summary = {"mode": "missing", "url": args.missing}
+        else:
+            return
+        final = finalize()
+        log("[END] 무질문 실행 완료")
+        if JSON_MODE:
+            final.update(summary)
+            _print_json_summary(final)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def run_headless_list(db_conn, url, args):
+    """--list 용: 필터 목록 표시 + 행 반환 (API 호출 없음)."""
+    filt = {"type": parse_video_type(args.type),
+            "keyword": (args.keyword or "").strip().lower(),
+            "dur_min": None, "dur_max": None, "status": "all"}
+    try:
+        filt["dur_min"], filt["dur_max"] = parse_dur_filter(args.dur)
+    except ValueError:
+        log("길이 조건 파싱 실패 → 없이 진행")
+    st = (args.status or "all").strip().lower()
+    filt["status"] = st if st in ("downloaded", "missing") else "all"
+    return show_channel_list(db_conn, url, filt)
+
+
+def run_headless_missing(db_conn, url, args, langs, auto_subs, sub_format, encoding,
+                         date_op, date_val, dmin, dmax):
+    """--missing 용: 미수신만 순서·선택대로 무질문 실행 (--yes 필요)."""
+    filt = {"type": parse_video_type(args.type),
+            "keyword": (args.keyword or "").strip().lower(),
+            "dur_min": None, "dur_max": None, "status": "missing"}
+    try:
+        filt["dur_min"], filt["dur_max"] = parse_dur_filter(args.dur)
+    except ValueError:
+        log("길이 조건 파싱 실패 → 없이 진행")
+    rows = show_channel_list(db_conn, url, filt)
+    if not rows:
+        log("[안내] 받을 후보가 없습니다")
+        return
+    if (args.order or "asc").strip().lower() in ("desc", "r", "reverse", "역순"):
+        rows = list(reversed(rows))
+        log("[안내] 역순으로 진행합니다")
+    try:
+        picked = parse_selection(args.select or "all", len(rows))
+    except ValueError:
+        log("선택 파싱 실패 → 취소")
+        return
+    if not picked:
+        log("선택 없음 → 취소")
+        return
+    targets = [rows[i - 1] for i in picked]
+    target = normalize_scan_target(url)
+    mode = "channel" if target.startswith("channel:") else "single"
+    log(f"[일괄] 미수신 {len(targets)}개 무질문 시작")
+    _run_missing_targets(db_conn, targets, mode, date_op, date_val, dmin, dmax,
+                         langs, auto_subs, sub_format, encoding)
+
+
+def run_headless_batch(db_conn, kind, url, urls, args, langs, auto_subs, sub_format,
+                       encoding, vtype, date_op, date_val, dmin, dmax, s, e):
+    """--channel/--playlist/--single 용 무질문 실행."""
+    if kind == "channel":
+        run_channel(url, s, e, date_op, date_val, dmin, dmax,
+                    langs, auto_subs, sub_format, db_conn, encoding, vtype)
+    elif kind == "playlist":
+        run_playlist(url, s, e, date_op, date_val, dmin, dmax,
+                     langs, auto_subs, sub_format, db_conn, encoding, vtype)
+    else:
+        export_cookies_from_chrome()
+        for i, u in enumerate(urls, 1):
+            log(f"[일괄] {i}/{len(urls)}")
+            run_single(u, date_op, date_val, dmin, dmax,
+                       langs, auto_subs, sub_format, db_conn, encoding, do_cookie=False)
+
+
+def _cli_common(args):
+    """CLI 공용 옵션 → (langs, auto, fmt, enc, vtype, date_op, date_val, dmin, dmax, s, e).
+
+    잘못된 값은 경고 후 해당 조건 없이 진행 (대화형과 동일).
+    """
+    langs = parse_langs(args.langs)
+    auto_subs = not args.no_auto
+    sub_format = parse_sub_format(args.format)
+    encoding = normalize_encoding(args.encoding)
+    vtype = parse_video_type(args.type)
+    try:
+        date_op, date_val = parse_date_filter(args.date)
+    except ValueError as ve:
+        log(f"날짜 조건 파싱 실패 → 없이 진행 ({ve})")
+        date_op, date_val = None, None
+    try:
+        dmin, dmax = parse_dur_filter(args.dur)
+    except ValueError:
+        log("길이 조건 파싱 실패 → 없이 진행")
+        dmin, dmax = None, None
+    try:
+        s, e = parse_range_filter(args.range)
+    except ValueError:
+        log("범위 파싱 실패 → 전체 처리")
+        s, e = None, None
+    return langs, auto_subs, sub_format, encoding, vtype, date_op, date_val, dmin, dmax, s, e
+
+
+def _apply_out_dir(out):
+    """--out 우선, 없으면 지난번/기본값. 저장 위치 확정."""
+    global SUBTITLE_DIR
+    if (out or "").strip():
+        SUBTITLE_DIR = os.path.abspath(os.path.expanduser(out.strip().strip('"').strip("'")))
+    else:
+        SUBTITLE_DIR = _load_last_save_dir() or SUBTITLE_DIR
+    ensure_dirs()
 
 
 def run_headless_scan(url: str, video_type: str = "long"):
@@ -2151,7 +2399,7 @@ def run_headless_scan(url: str, video_type: str = "long"):
     log(f"[START] 무질문 스캔: {url} ({video_type})")
     conn = db_init(DB_PATH)
     try:
-        run_scan(url, video_type, conn)
+        summary = run_scan(url, video_type, conn)
         try:
             write_dashboard(conn)
         except Exception as e:
@@ -2162,6 +2410,10 @@ def run_headless_scan(url: str, video_type: str = "long"):
         except Exception:
             pass
     log("[END] 무질문 스캔 완료")
+    if JSON_MODE:
+        _print_json_summary({"mode": "scan", "url": url,
+                             "total": (summary or {}).get("total", 0),
+                             "new": (summary or {}).get("new", 0)})
 
 
 def run_headless_retry(selection_raw="all"):
@@ -2204,12 +2456,15 @@ def run_headless_retry(selection_raw="all"):
             conn.close()
         except Exception:
             pass
-    finalize()
+    summary = finalize()
     log("[END] 무질문 재시도 완료")
+    if JSON_MODE:
+        summary.update({"mode": "retry"})
+        _print_json_summary(summary)
 
 
 def main():
-    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE
+    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE, JSON_MODE
     apply_config(load_config())  # 설정 파일 우선 적용 (없으면 기본값으로 생성)
     # P5-7: 이번 실행 전용 로그 파일 (대시보드·트러블슈팅용)
     try:
@@ -2223,7 +2478,9 @@ def main():
     log(f"설정 파일: {CONFIG_PATH}")
     args = parse_cli()
     HEADLESS = bool(args.headless or args.retry_failed is not None or args.scan is not None
-                    or args.dashboard)
+                    or args.dashboard or args.channel or args.playlist or args.single
+                    or args.list or args.missing)
+    JSON_MODE = bool(args.json)
     if args.scan is not None:
         run_headless_scan(args.scan, args.scan_type or "long")
         return
@@ -2231,15 +2488,21 @@ def main():
         ensure_dirs()
         conn = db_init(DB_PATH)
         try:
-            write_dashboard(conn)
+            path = write_dashboard(conn)
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+        if JSON_MODE:
+            _print_json_summary({"mode": "dashboard", "path": path})
         return
     if args.retry_failed is not None:
         run_headless_retry(args.retry_select or args.retry_failed)
+        return
+    if args.channel or args.playlist or args.single or args.list or args.missing:
+        _apply_out_dir(args.out)
+        run_headless_flow(args)
         return
     SUBTITLE_DIR = ask_save_location()  # 저장 위치 먼저 확정 (이후 모든 경로가 여기를 따름)
     ensure_dirs()
@@ -2263,8 +2526,11 @@ def main():
         except Exception:
             pass
 
-    finalize()
+    summary = finalize()
     log("[END] 전체 작업 완료")
+    if JSON_MODE:
+        summary.update({"mode": "interactive"})
+        _print_json_summary(summary)
 
 
 def _main_menu(db_conn):
