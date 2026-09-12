@@ -1058,9 +1058,14 @@ def _to_entries_list(info):
 # =============== 모드별 실행 ===============
 
 def run_single(url: str, date_op=None, date_val=None, dur_min_sec=None, dur_max_sec=None,
-               langs=None, auto_subs=True, sub_format="vtt/best", db_conn=None, encoding="utf-8"):
-    """모드 2: 개별 영상 1개의 자막 (종류는 기록용으로만 판별)."""
-    export_cookies_from_chrome()
+               langs=None, auto_subs=True, sub_format="vtt/best", db_conn=None, encoding="utf-8",
+               do_cookie=True):
+    """모드 2: 개별 영상 1개의 자막 (종류는 기록용으로만 판별).
+
+    do_cookie=False면 쿠키 추출 생략 (묶음 처리 시 첫 1회만 추출용).
+    """
+    if do_cookie:
+        export_cookies_from_chrome()
     log(f"[START] 개별 영상 자막: {url}")
     run_id = _run_begin(db_conn, "single", url)
     before = _counters()
@@ -2055,6 +2060,26 @@ def ask_video_type():
     return "long"
 
 
+def ask_manual_urls():
+    """수동 URL 묶음 입력. 한 줄에 1개씩 (공백 구분 여러 개도 가능), 빈 줄이면 시작.
+
+    반환: URL 목록 (없으면 빈 목록).
+    """
+    urls = []
+    while True:
+        prompt = "영상 URL (빈 줄이면 시작): " if urls else "영상 URL (1개씩 입력, 빈 줄이면 시작/종료): "
+        try:
+            line = input(prompt)
+        except EOFError:
+            break
+        if not line.strip():
+            break
+        for p in line.strip().split():
+            if p.strip():
+                urls.append(p.strip())
+    return urls
+
+
 def ask_optional_filters(with_range=True):
     """날짜/길이/번호 조건 묻기 (전부 Enter면 조건 없음)."""
     date_op = date_val = None
@@ -2301,12 +2326,17 @@ def _main_menu(db_conn):
     langs, auto_subs, sub_format, encoding = ask_lang_config()
 
     if mode == "2":
-        url = input("영상 URL: ").strip()
-        if not url:
+        urls = ask_manual_urls()
+        if not urls:
             log("[END] URL이 없어 종료")
             return
+        log(f"[일괄] 직접 입력 {len(urls)}개 순차 처리")
         date_op, date_val, dmin, dmax, _, _ = ask_optional_filters(with_range=False)
-        run_single(url, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format, db_conn, encoding)
+        export_cookies_from_chrome()
+        for i, url in enumerate(urls, 1):
+            log(f"[일괄] {i}/{len(urls)}")
+            run_single(url, date_op, date_val, dmin, dmax, langs, auto_subs, sub_format, db_conn,
+                       encoding, do_cookie=False)
     elif mode == "3":
         url = input("재생목록 URL: ").strip()
         if not url:
