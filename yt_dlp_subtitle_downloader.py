@@ -39,7 +39,8 @@ from subtitle_db import (
     db_latest_failed, db_count_by_status, db_last_success,
     db_cleanup_stale_running, normalize_scan_target, db_record_scan,
     db_latest_scan, db_scan_history, db_missing_subs, db_dashboard_data,
-    db_success_count, db_channel_overview,
+    db_success_count, db_channel_overview, db_run_start, db_run_finish,
+    db_recent_runs,
 )
 
 # =============== 환경 설정 ===============
@@ -215,8 +216,76 @@ def log(msg: str, to_file: bool = True):
             ensure_dirs()
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
+            if RUN_LOG_FILE:  # P5-7: 실행별 로그 파일에도 동시 기록
+                try:
+                    os.makedirs(os.path.dirname(RUN_LOG_FILE), exist_ok=True)
+                    with open(RUN_LOG_FILE, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[로그 실패] {e}")
+
+
+RUN_LOG_FILE = None  # P5-7: 이번 실행 전용 로그 (main에서 설정)
+DASHBOARD_EVERY_N = 10  # P5-7: N개 처리마다 대시보드 실시간 갱신
+
+
+def _counters():
+    """결과 집계 현재값 (작업 전후 차이 계산용)."""
+    return {"s": len(SUCCESS_LIST), "f": len(FAIL_LIST), "sk": len(SKIPPED_LIST),
+            "c": len(CACHED_LIST), "n": len(NO_SUB_LIST)}
+
+
+def _run_begin(db_conn, kind, target):
+    """작업 시작 기록. 반환: runs id (실패 시 None)."""
+    if db_conn is None:
+        return None
+    try:
+        return db_run_start(db_conn, kind, target)
+    except Exception as e:
+        log(f"[경고] 작업 시작 기록 실패: {e}")
+        return None
+
+
+def _run_end(db_conn, run_id, total, before, note=""):
+    """작업 종료 기록 (전후 차이로 결과 카운트)."""
+    if db_conn is None or run_id is None:
+        return
+    after = _counters()
+    try:
+        db_run_finish(db_conn, run_id, total,
+                      after["s"] - before["s"], after["f"] - before["f"],
+                      after["sk"] - before["sk"], after["c"] - before["c"], note)
+    except Exception as e:
+        log(f"[경고] 작업 종료 기록 실패: {e}")
+
+
+def _maybe_refresh_dashboard(db_conn, done):
+    """N개마다 대시보드 실시간 갱신 (실패해도 다운로드는 계속)."""
+    if db_conn is None or done % DASHBOARD_EVERY_N != 0:
+        return
+    try:
+        write_dashboard(db_conn)
+    except Exception as e:
+        log(f"[경고] 대시보드 갱신 실패: {e}", to_file=False)
+
+
+def fmt_run_duration(started_at: str, finished_at: str) -> str:
+    """ISO 시각 차이를 '3분 20초' 형태로. 파싱 실패 시 '-'. """
+    try:
+        s = datetime.fromisoformat(started_at)
+        e = datetime.fromisoformat(finished_at)
+        sec = max(0, int((e - s).total_seconds()))
+    except (TypeError, ValueError):
+        return "-"
+    m, sec = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}시간 {m}분"
+    if m:
+        return f"{m}분 {sec}초"
+    return f"{sec}초"
 
 
 def rotate_old_cookie():
@@ -922,6 +991,8 @@ def process_entries(entries, start_idx, end_idx, mode: str, label: str,
     log(f"[START] {label}: 총 {total}개 중 {s} ~ {e} 처리"
         + (f" (종류: {video_type})" if video_type != "both" else " (롱폼+숏폼)"))
 
+    run_id = _run_begin(db_conn, mode, label)
+    before = _counters()
     done = 0
     type_skipped = 0
     consec_429 = 0
@@ -961,10 +1032,13 @@ def process_entries(entries, start_idx, end_idx, mode: str, label: str,
         if done % COOKIE_REFRESH_EVERY_N_VIDEOS == 0:
             log(f"[주기] {COOKIE_REFRESH_EVERY_N_VIDEOS}개마다 쿠키 갱신")
             export_cookies_from_chrome()
+        _maybe_refresh_dashboard(db_conn, done)
         _sleep_between_videos()
     if type_skipped:
         log(f"[안내] 종류 조건으로 {type_skipped}개 제외 (요청 없음)")
     log(f"[END] {label} 처리 완료")
+    _run_end(db_conn, run_id, done, before,
+             f"종류제외 {type_skipped}개" if type_skipped else "")
 
 
 def _to_entries_list(info):
@@ -988,6 +1062,8 @@ def run_single(url: str, date_op=None, date_val=None, dur_min_sec=None, dur_max_
     """모드 2: 개별 영상 1개의 자막 (종류는 기록용으로만 판별)."""
     export_cookies_from_chrome()
     log(f"[START] 개별 영상 자막: {url}")
+    run_id = _run_begin(db_conn, "single", url)
+    before = _counters()
     sub_filter = SubtitleFilter(date_op, date_val, dur_min_sec, dur_max_sec)
     # URL에 &list= 가 섞여 있어도 영상 1개만 처리 (재생목록 전체 받는 사고 방지)
     download_subs_for_video(url, "single", sub_filter, langs, auto_subs, sub_format,
@@ -995,6 +1071,7 @@ def run_single(url: str, date_op=None, date_val=None, dur_min_sec=None, dur_max_
                             entry_video_id=parse_video_id_from_url(url),
                             entry_video_type=classify_type(url=url))
     _sleep_between_videos()
+    _run_end(db_conn, run_id, 1, before)
 
 
 def run_playlist(url: str, start_idx=None, end_idx=None, date_op=None, date_val=None,
@@ -1102,6 +1179,7 @@ def fmt_duration(sec) -> str:
 def run_scan(url: str, video_type: str = "long", db_conn=None):
     """모드 6: 스캔만 실행. 스냅샷 저장 후 신규·자막없음 목록 표시. 반환: 요약 dict."""
     export_cookies_from_chrome()
+    run_id = _run_begin(db_conn, "scan", url)
     kind = "playlist" if re.search(r"[?&]list=", url) else "channel"
     target = normalize_scan_target(url)
     items = []
@@ -1110,6 +1188,7 @@ def run_scan(url: str, video_type: str = "long", db_conn=None):
         info = fetch_flat_list(url)
         if info is None:
             log(f"[END] 정보를 가져오지 못함: {url}")
+            _run_end(db_conn, run_id, 0, _counters(), "목록 조회 실패")
             return None
         entries = _to_entries_list(info)
         if entries is None:
@@ -1175,6 +1254,9 @@ def run_scan(url: str, video_type: str = "long", db_conn=None):
         if len(missing) > 50:
             print(f"... 외 {len(missing) - 50}개 (대시보드에서 전체 확인)")
     log("[END] 스캔 완료 (다운로드 없음 - 조건을 정해 모드 1~3으로 받으세요)")
+    _run_end(db_conn, run_id, len(items), _counters(),
+             f"신규 {summary['new']}개" if summary else "")
+    _maybe_refresh_dashboard(db_conn, DASHBOARD_EVERY_N)
     return summary
 
 
@@ -1265,7 +1347,10 @@ def _execute_retry_targets(db_conn, targets):
     """
     export_cookies_from_chrome()
     log(f"[START] 실패 재시도: {len(targets)}개")
+    run_id = _run_begin(db_conn, "retry", f"{len(targets)}건")
+    before = _counters()
     consec_429 = 0
+    done_retry = 0
     for n, row in enumerate(targets, 1):
         url = row["url"]
         langs = [p.strip() for p in (row["langs"] or "ko,en").split(",") if p.strip()]
@@ -1285,6 +1370,7 @@ def _execute_retry_targets(db_conn, targets):
             log("[중단] 재시도 중단 (남은 항목은 DB에 보관됨)")
             break
         log(f"[END] 재시도 {n}/{len(targets)}: {result}")
+        done_retry += 1
         consec_429 = consec_429 + 1 if saw_429 else 0
         if consec_429 >= MAX_CONSECUTIVE_429:
             log(f"[차단기] 429가 {MAX_CONSECUTIVE_429}회 연속 → 나머지 중단 (모드 4로 나중에 재개 가능)")
@@ -1298,6 +1384,8 @@ def _execute_retry_targets(db_conn, targets):
                 log("[중단] 재시도 중단 (남은 항목은 DB에 보관됨)")
                 break
     log("[END] 실패 재시도 완료")
+    _maybe_refresh_dashboard(db_conn, DASHBOARD_EVERY_N)
+    _run_end(db_conn, run_id, done_retry, before)
 
 
 # =============== 예약 영속성: Windows 작업 스케줄러 (P2-3) ===============
@@ -1559,7 +1647,7 @@ def status_badge(dl_status):
     return ("없음", "#cf222e")
 
 
-def build_dashboard_html(targets, generated_at: str) -> str:
+def build_dashboard_html(targets, generated_at: str, runs=None, logfiles=None) -> str:
     """대시보드 HTML 한 장 (인라인 CSS + 제목/상태 필터 JS)."""
     total_videos = sum(len(t["items"]) for t in targets)
     total_with = sum(1 for t in targets for it in t["items"] if it.get("dl_status") == "success")
@@ -1578,6 +1666,28 @@ def build_dashboard_html(targets, generated_at: str) -> str:
                  "<select id=\"st\"><option value=\"\">전체 상태</option>"
                  "<option>있음</option><option>없음</option><option>실패</option>"
                  "<option>스킵</option></select></div>")
+    if runs:
+        parts.append("<div class=\"card\"><h2>최근 실행</h2>"
+                     "<table><tr><th>종류</th><th>대상</th><th>시작</th><th>소요</th>"
+                     "<th>전체</th><th>성공</th><th>실패</th><th>비고</th></tr>")
+        for r in runs:
+            dur = fmt_run_duration(r.get("started_at", ""), r.get("finished_at", ""))
+            parts.append(
+                f"<tr><td>{html.escape(str(r.get('kind', '')))}</td>"
+                f"<td>{html.escape(str(r.get('target', ''))[:60])}</td>"
+                f"<td>{html.escape(str(r.get('started_at', '')))}</td>"
+                f"<td>{html.escape(dur)}</td>"
+                f"<td>{r.get('total', 0)}</td><td>{r.get('success', 0)}</td>"
+                f"<td>{r.get('failed', 0)}</td>"
+                f"<td>{html.escape(str(r.get('note', ''))[:60])}</td></tr>")
+        parts.append("</table></div>")
+    if logfiles:
+        parts.append("<div class=\"card\"><h2>최근 로그 파일</h2><table>"
+                     "<tr><th>파일</th><th>크기</th><th>수정시각</th></tr>")
+        for name, size_kb, mtime in logfiles:
+            parts.append(f"<tr><td>{html.escape(name)}</td><td>{size_kb}KB</td>"
+                         f"<td>{html.escape(mtime)}</td></tr>")
+        parts.append("</table></div>")
     for t in targets:
         sc = t["scan"]
         parts.append("<div class=\"card\">"
@@ -1614,15 +1724,43 @@ def build_dashboard_html(targets, generated_at: str) -> str:
     return "".join(parts)
 
 
+def list_run_logs(limit: int = 10):
+    """logs/ 폴더의 실행 로그 목록 (이름, KB, 수정시각) 최신순. 실패해도 빈 목록."""
+    try:
+        logdir = os.path.join(DOWNLOAD_DIR, "logs")
+        if not os.path.isdir(logdir):
+            return []
+        rows = []
+        for name in os.listdir(logdir):
+            if not (name.startswith("run_") and name.endswith(".log")):
+                continue
+            fp = os.path.join(logdir, name)
+            try:
+                st = os.stat(fp)
+                rows.append((name, max(1, st.st_size // 1024),
+                             datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                             st.st_mtime))
+            except OSError:
+                continue
+        rows.sort(key=lambda r: r[3], reverse=True)
+        return [(n, s, m) for n, s, m, _ in rows[:limit]]
+    except Exception:
+        return []
+
+
 def write_dashboard(db_conn, path=None) -> str:
-    """DB → dashboard.html 생성. 반환: 저장 경로."""
+    """DB → dashboard.html 생성 (최근 실행 + 로그 목록 포함). 반환: 저장 경로."""
     if path is None:
         ensure_dirs()
         path = os.path.join(DOWNLOAD_DIR, "dashboard.html")
     data = db_dashboard_data(db_conn)
+    try:
+        runs = db_recent_runs(db_conn)
+    except Exception:
+        runs = []
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(build_dashboard_html(data, generated))
+        f.write(build_dashboard_html(data, generated, runs, list_run_logs()))
     log(f"대시보드 생성 → {path} (대상 {len(data)}곳)")
     return path
 
@@ -1770,6 +1908,8 @@ def run_download_missing(db_conn, langs=None, auto_subs=True, sub_format="vtt/be
         return
 
     log(f"[START] 미수신 순차 다운로드: {len(targets)}개")
+    run_id = _run_begin(db_conn, "missing", f"{len(targets)}건")
+    before = _counters()
     consec_429 = 0
     done = 0
     for n, t in enumerate(targets, 1):
@@ -1794,7 +1934,9 @@ def run_download_missing(db_conn, langs=None, auto_subs=True, sub_format="vtt/be
             _sleep_between_videos()
             if done % COOKIE_REFRESH_EVERY_N_VIDEOS == 0:
                 export_cookies_from_chrome()
+        _maybe_refresh_dashboard(db_conn, done)
     log(f"[END] 미수신 순차 다운로드 완료 ({done}/{len(targets)})")
+    _run_end(db_conn, run_id, done, before)
 
 
 def finalize():
@@ -2042,8 +2184,17 @@ def run_headless_retry(selection_raw="all"):
 
 
 def main():
-    global SUBTITLE_DIR, HEADLESS
+    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE
     apply_config(load_config())  # 설정 파일 우선 적용 (없으면 기본값으로 생성)
+    # P5-7: 이번 실행 전용 로그 파일 (대시보드·트러블슈팅용)
+    try:
+        RUN_LOG_FILE = os.path.join(
+            DOWNLOAD_DIR, "logs",
+            "run_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
+        os.makedirs(os.path.dirname(RUN_LOG_FILE), exist_ok=True)
+    except Exception as e:
+        print(f"[경고] 실행 로그 준비 실패: {e}")
+        RUN_LOG_FILE = None
     log(f"설정 파일: {CONFIG_PATH}")
     args = parse_cli()
     HEADLESS = bool(args.headless or args.retry_failed is not None or args.scan is not None
