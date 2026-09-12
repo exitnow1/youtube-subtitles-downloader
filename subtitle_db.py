@@ -67,6 +67,20 @@ CREATE TABLE IF NOT EXISTS scan_items (
 CREATE INDEX IF NOT EXISTS idx_scan_items_videoid ON scan_items(video_id);
 CREATE INDEX IF NOT EXISTS idx_scan_items_scanid ON scan_items(scan_id);
 CREATE INDEX IF NOT EXISTS idx_scans_target ON scans(target_url);
+CREATE TABLE IF NOT EXISTS runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT DEFAULT '',
+  target TEXT DEFAULT '',
+  started_at TEXT NOT NULL,
+  finished_at TEXT DEFAULT '',
+  total INTEGER DEFAULT 0,
+  success INTEGER DEFAULT 0,
+  failed INTEGER DEFAULT 0,
+  skipped INTEGER DEFAULT 0,
+  cached INTEGER DEFAULT 0,
+  note TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
 """
 
 
@@ -338,6 +352,35 @@ def db_dashboard_data(conn: sqlite3.Connection):
                     "items": [dict(r) for r in items],
                     "history": [dict(r) for r in hist]})
     return out
+
+
+def db_run_start(conn: sqlite3.Connection, kind: str, target: str) -> int:
+    """작업 시작 기록 → runs id 반환."""
+    cur = conn.execute(
+        "INSERT INTO runs (kind, target, started_at) VALUES (?, ?, ?)",
+        (kind, target, now_iso()),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def db_run_finish(conn: sqlite3.Connection, run_id: int, total: int = 0,
+                  success: int = 0, failed: int = 0, skipped: int = 0,
+                  cached: int = 0, note: str = "") -> None:
+    """작업 종료 기록 (결과 카운트)."""
+    conn.execute(
+        """UPDATE runs SET finished_at=?, total=?, success=?, failed=?,
+           skipped=?, cached=?, note=? WHERE id=?""",
+        (now_iso(), total, success, failed, skipped, cached, note, run_id),
+    )
+    conn.commit()
+
+
+def db_recent_runs(conn: sqlite3.Connection, limit: int = 10):
+    """최근 작업 목록 (최신순)."""
+    rows = conn.execute(
+        "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def db_channel_overview(conn: sqlite3.Connection, target_url: str):
