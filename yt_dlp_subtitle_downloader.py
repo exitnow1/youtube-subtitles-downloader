@@ -43,6 +43,13 @@ from subtitle_db import (
     db_recent_runs,
 )
 
+# Windows 콘솔(cp949)에서 한글 자모 등이 인코딩 안 되어 print()가 죽는 것을 방지
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+    sys.stderr.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
 # =============== 환경 설정 ===============
 DOWNLOAD_DIR = r"C:\Users\rpt53\Downloads"
 SUBTITLE_DIR = os.path.join(DOWNLOAD_DIR, "subtitles")
@@ -311,6 +318,8 @@ def _try_load_browser_cookies():
         ("chrome youtube.com", lambda: browser_cookie3.chrome(domain_name="youtube.com")),
         ("chrome .youtube.com", lambda: browser_cookie3.chrome(domain_name=".youtube.com")),
         ("chrome 전체", lambda: browser_cookie3.chrome()),
+        ("brave youtube.com", lambda: browser_cookie3.brave(domain_name="youtube.com")),
+        ("brave 전체", lambda: browser_cookie3.brave()),
         ("edge youtube.com", lambda: browser_cookie3.edge(domain_name="youtube.com")),
         ("firefox youtube.com", lambda: browser_cookie3.firefox(domain_name="youtube.com")),
     ]
@@ -615,6 +624,91 @@ def parse_video_id_from_url(url: str):
     return m.group(1) if m else None
 
 
+YOUTUBE_URL_RE = re.compile(
+    r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?[^\s\)\]\"'<>]*"
+    r"|shorts/[\w-]+|live/[\w-]+|embed/[\w-]+)|youtu\.be/[\w-]+)[^\s\)\]\"'<>]*",
+    re.IGNORECASE)
+_TRAILING_PUNCT = ".,;:!?‐‑‒–—―…~'\"`)}]>"
+
+
+def extract_youtube_urls_from_text(text: str):
+    """텍스트에서 유튜브 영상 URL을 순서 유지 + 중복 제거로 추출."""
+    found, seen = [], set()
+    if not text:
+        return found
+    for m in YOUTUBE_URL_RE.finditer(text):
+        u = m.group(0).rstrip(_TRAILING_PUNCT)
+        vid = parse_video_id_from_url(u)
+        if not vid:
+            continue
+        key = "https://www.youtube.com/watch?v=" + vid
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+    return found
+
+
+def load_urls_from_file(path: str):
+    """txt/md/csv/xlsx 파일에서 유튜브 영상 URL 목록 추출.
+
+    반환: (urls, stats) — stats는 {lines, cells, urls_found, skipped}.
+    표기: 표 파일(xlsx)은 값 셀 + 하이퍼링크 대상을 모두 검사.
+    영상 URL이 아닌 줄/셀(채널·재생목록 주소, 일반 텍스트)은 skipped로 집계.
+    """
+    import csv as _csv
+    stats = {"lines": 0, "cells": 0, "urls_found": 0, "skipped": 0}
+    texts = []
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx",):
+        try:
+            import openpyxl as _oxl
+        except ImportError:
+            raise RuntimeError("xlsx 읽기용 openpyxl 필요: pip install openpyxl")
+        # read_only=False: 하이퍼링크(.hyperlink) 접근용 (URL 목록은 작아 부담 없음)
+        wb = _oxl.load_workbook(path, read_only=False, data_only=True)
+        try:
+            for ws in wb.worksheets:
+                for row in ws.iter_rows():
+                    for cell in row:
+                        v = cell.value
+                        if v is None or (isinstance(v, str) and not v.strip()):
+                            continue
+                        stats["cells"] += 1
+                        texts.append(str(v))
+                        try:
+                            tgt = (cell.hyperlink.target
+                                   if cell.hyperlink is not None else None)
+                        except Exception:
+                            tgt = None
+                        if tgt:
+                            texts.append(str(tgt))
+        finally:
+            try:
+                wb.close()
+            except Exception:
+                pass
+    elif ext in (".csv",):
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in _csv.reader(f):
+                for cell in row:
+                    if cell is None or not str(cell).strip():
+                        continue
+                    stats["cells"] += 1
+                    texts.append(str(cell))
+    else:  # .txt / .md / 그 외는 텍스트로 취급
+        with open(path, "r", encoding="utf-8-sig") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                stats["lines"] += 1
+                texts.append(line)
+    urls = extract_youtube_urls_from_text("\n".join(texts))
+    stats["urls_found"] = len(urls)
+    units = stats["lines"] + stats["cells"]
+    stats["skipped"] = max(0, units - len(urls))
+    return urls, stats
+
+
 def find_subtitle_files(video_id: str):
     """SUBTITLE_DIR 아래에서 해당 영상 ID가 들어간 자막 파일들 찾기."""
     found = []
@@ -753,6 +847,11 @@ def detect_title_lang(title):
 def _build_fallback_plan(langs, auto_subs):
     """1순위 후보 (사용자 요청 설정). 나머지는 제목을 안 뒤에 동적으로 만듦."""
     lang_list = list(langs) if isinstance(langs, (list, tuple)) else [langs]
+    if MAIN_ONLY and len(lang_list) > 1 and "all" not in lang_list:
+        # 메인 1개 모드: 언어를 한 번에 묶지 않고 우선순위대로 단일 라운드씩.
+        # 호출부 루프가 첫 성공 라운드에서 중단하므로 결과는 트랙 1개.
+        auto_tag = ",자동" if auto_subs else ""
+        return [([l], auto_subs, f"메인 후보({l}{auto_tag})") for l in lang_list]
     return [(lang_list, auto_subs,
              f"요청 설정({','.join(lang_list)}{',자동' if auto_subs else ''})")]
 
@@ -774,10 +873,18 @@ def _build_title_rest(tried, req_langs, title):
 
     if tlang:
         consider([tlang], True, f"제목언어 자동({tlang}+자동)")
-        consider(req_list, True, "요청언어 자동")
+        if MAIN_ONLY and len(req_list) > 1 and "all" not in req_list:
+            for l in req_list:
+                consider([l], True, f"요청언어 자동({l})")
+        else:
+            consider(req_list, True, "요청언어 자동")
         consider([tlang], False, f"제목언어 수동({tlang})")
     elif "all" not in req_list:
-        consider(req_list, True, "자동자막 폴백")
+        if MAIN_ONLY and len(req_list) > 1:
+            for l in req_list:
+                consider([l], True, f"요청언어 자동({l})")
+        else:
+            consider(req_list, True, "자동자막 폴백")
     for fb in FALLBACK_LANGS:
         consider([fb], True, f"언어 폴백({fb}+자동)")
     return rest
@@ -1059,24 +1166,84 @@ def _to_entries_list(info):
 
 def run_single(url: str, date_op=None, date_val=None, dur_min_sec=None, dur_max_sec=None,
                langs=None, auto_subs=True, sub_format="vtt/best", db_conn=None, encoding="utf-8",
-               do_cookie=True):
+               do_cookie=True, kind="single"):
     """모드 2: 개별 영상 1개의 자막 (종류는 기록용으로만 판별).
 
     do_cookie=False면 쿠키 추출 생략 (묶음 처리 시 첫 1회만 추출용).
+    kind는 runs 기록용 구분 (single / file).
     """
     if do_cookie:
         export_cookies_from_chrome()
     log(f"[START] 개별 영상 자막: {url}")
-    run_id = _run_begin(db_conn, "single", url)
+    run_id = _run_begin(db_conn, kind, url)
     before = _counters()
     sub_filter = SubtitleFilter(date_op, date_val, dur_min_sec, dur_max_sec)
     # URL에 &list= 가 섞여 있어도 영상 1개만 처리 (재생목록 전체 받는 사고 방지)
-    download_subs_for_video(url, "single", sub_filter, langs, auto_subs, sub_format,
-                            noplaylist=True, db_conn=db_conn, encoding=encoding,
-                            entry_video_id=parse_video_id_from_url(url),
-                            entry_video_type=classify_type(url=url))
+    result, saw_429 = download_subs_for_video(url, "single", sub_filter, langs, auto_subs, sub_format,
+                                              noplaylist=True, db_conn=db_conn, encoding=encoding,
+                                              entry_video_id=parse_video_id_from_url(url),
+                                              entry_video_type=classify_type(url=url))
     _sleep_between_videos()
     _run_end(db_conn, run_id, 1, before)
+    return result, saw_429
+
+
+def run_file(path: str, start_idx=None, end_idx=None, date_op=None, date_val=None,
+             dur_min_sec=None, dur_max_sec=None, langs=None, auto_subs=True,
+             sub_format="vtt/best", db_conn=None, encoding="utf-8"):
+    """파일 입력 모드: txt/md/csv/xlsx 속 영상 URL 묶음 자막 다운로드.
+
+    각 URL은 개별 영상 경로(run_single)로 처리되어 DB·로그에 건당 기록됨
+    (runs kind=file). --range는 파일 내 URL 순서에 적용.
+    """
+    try:
+        urls, stats = load_urls_from_file(path)
+    except FileNotFoundError:
+        log(f"[END] 파일 없음: {path}")
+        FAIL_LIST.append({"title": path, "url": path})
+        return {"urls_found": 0, "error": "file_not_found"}
+    except Exception as e:
+        log(f"[END] 파일 읽기 실패: {path} / {e}")
+        FAIL_LIST.append({"title": path, "url": path})
+        return {"urls_found": 0, "error": str(e)[:200]}
+    total = len(urls)
+    log(f"[START] 파일 입력: {path} (URL {total}개, URL 없는 줄/셀 {stats['skipped']}개)")
+    if total == 0:
+        log("[경고] 영상 URL이 없음 (채널·재생목록 주소는 파일 모드에서 제외됨)")
+        return {"urls_found": 0, "error": "no_urls"}
+    s = start_idx if start_idx is not None else 1
+    e = end_idx if end_idx is not None else total
+    s = max(1, s)
+    e = min(total, e)
+    if s > e:
+        log(f"[경고] 범위 오류 s={s} > e={e} → 전체 처리로 폴백")
+        s, e = 1, total
+    targets = urls[s - 1:e]
+    log(f"[START] 파일 묶음: 총 {total}개 중 {s} ~ {e} 처리 ({len(targets)}개)")
+    run_id = _run_begin(db_conn, "file", f"{path} ({s}~{e}/{total})")
+    before = _counters()
+    export_cookies_from_chrome()
+    consec_429 = 0
+    done = 0
+    for i, u in enumerate(targets, 1):
+        log(f"[일괄] {i}/{len(targets)}")
+        # run_single이 건당 runs 시작/종료·DB 기록·대기를 처리 (kind=file로 구분)
+        _, saw_429 = run_single(u, date_op, date_val, dur_min_sec, dur_max_sec,
+                                langs, auto_subs, sub_format, db_conn, encoding,
+                                do_cookie=False, kind="file")
+        done += 1
+        # 차단기: 429가 연속되면 IP가 달아오른 상태 → 나머지 중단 (DB에 남아 나중에 재개)
+        consec_429 = consec_429 + 1 if saw_429 else 0
+        if consec_429 >= MAX_CONSECUTIVE_429:
+            log(f"[차단기] 429가 {MAX_CONSECUTIVE_429}회 연속 → 나머지 중단 "
+                f"(같은 파일로 다시 실행하면 이어받기 가능)")
+            break
+        if done % COOKIE_REFRESH_EVERY_N_VIDEOS == 0:
+            log(f"[주기] {COOKIE_REFRESH_EVERY_N_VIDEOS}개마다 쿠키 갱신")
+            export_cookies_from_chrome()
+        _maybe_refresh_dashboard(db_conn, done)
+    _run_end(db_conn, run_id, done, before)
+    return {"urls_found": total, "processed": done}
 
 
 def run_playlist(url: str, start_idx=None, end_idx=None, date_op=None, date_val=None,
@@ -2208,11 +2375,15 @@ def parse_cli(argv=None):
     p.add_argument("--channel", default=None, help="채널 자막 (URL)")
     p.add_argument("--playlist", default=None, help="재생목록 자막 (URL)")
     p.add_argument("--single", nargs="+", default=None, help="개별 영상 자막 (URL 1개 이상)")
+    p.add_argument("--file", default=None,
+                   help="파일 속 URL 묶음 자막 (txt/md/csv/xlsx, 영상 URL만)")
     p.add_argument("--list", default=None, help="목록 보기 (URL, DB만)")
     p.add_argument("--missing", default=None, help="미수신만 받기 (URL)")
     p.add_argument("--type", default="", help="long|shorts|both (기본 long)")
     p.add_argument("--langs", default="", help="자막 언어 (예: ko,en / all, 기본 ko,en)")
     p.add_argument("--no-auto", action="store_true", help="자동생성 자막 제외")
+    p.add_argument("--main-only", action="store_true",
+                   help="메인 자막 1개만 저장 (요청 언어 순서대로 단일 트랙씩 시도, 첫 성공에서 중단)")
     p.add_argument("--format", default="", help="vtt|srt (기본 vtt)")
     p.add_argument("--encoding", default="", help="utf-8|bom|cp949 (기본 utf-8)")
     p.add_argument("--out", default="", help="저장 폴더 (기본값: 지난번/기본)")
@@ -2229,6 +2400,7 @@ def parse_cli(argv=None):
 
 
 JSON_MODE = False  # --json: 마지막에 SUMMARY_JSON 1줄 (에이전트용)
+MAIN_ONLY = False  # --main-only: 메인 자막 1개만 (단일 트랙 라운드, 첫 성공에서 중단)
 
 
 def run_headless_flow(args):
@@ -2261,6 +2433,13 @@ def run_headless_flow(args):
                                langs, auto_subs, sub_format, encoding, vtype,
                                date_op, date_val, dmin, dmax, s, e)
             summary = {"mode": "single", "count": len(args.single)}
+        elif args.file:
+            log(f"[START] 무질문 파일 입력: {args.file}")
+            info = run_file(args.file, s, e, date_op, date_val, dmin, dmax,
+                            langs, auto_subs, sub_format, conn, encoding)
+            summary = {"mode": "file", "file": args.file}
+            if isinstance(info, dict):
+                summary.update(info)
         elif args.list:
             rows = run_headless_list(conn, args.list, args)
             summary = {"mode": "list", "url": args.list, "count": len(rows),
@@ -2464,7 +2643,7 @@ def run_headless_retry(selection_raw="all"):
 
 
 def main():
-    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE, JSON_MODE
+    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE, JSON_MODE, MAIN_ONLY
     apply_config(load_config())  # 설정 파일 우선 적용 (없으면 기본값으로 생성)
     # P5-7: 이번 실행 전용 로그 파일 (대시보드·트러블슈팅용)
     try:
@@ -2479,8 +2658,9 @@ def main():
     args = parse_cli()
     HEADLESS = bool(args.headless or args.retry_failed is not None or args.scan is not None
                     or args.dashboard or args.channel or args.playlist or args.single
-                    or args.list or args.missing)
+                    or args.list or args.missing or args.file)
     JSON_MODE = bool(args.json)
+    MAIN_ONLY = bool(args.main_only)
     if args.scan is not None:
         run_headless_scan(args.scan, args.scan_type or "long")
         return
@@ -2500,7 +2680,7 @@ def main():
     if args.retry_failed is not None:
         run_headless_retry(args.retry_select or args.retry_failed)
         return
-    if args.channel or args.playlist or args.single or args.list or args.missing:
+    if args.channel or args.playlist or args.single or args.list or args.missing or args.file:
         _apply_out_dir(args.out)
         run_headless_flow(args)
         return

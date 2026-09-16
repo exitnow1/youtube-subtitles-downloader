@@ -12,6 +12,7 @@ Batch-download YouTube subtitles (video files never fetched) with channel/playli
 ## When to use
 
 - One or more video URLs → subtitle files
+- A document file (txt/md/csv/xlsx) holding video URLs → subtitle files (`--file`)
 - Channel or playlist URL → many subtitle files, optionally filtered
 - "What's new / what's missing subtitles" questions about a channel
 - Failed subtitle jobs to retry, immediately or on a schedule
@@ -42,6 +43,8 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 | `--channel URL` | Channel subtitles |
 | `--playlist URL` | Playlist subtitles |
 | `--single URL [URL...]` | One or more individual videos |
+| `--file PATH` | URL batch from txt/md/csv/xlsx (video URLs only; runs recorded as `file`) |
+| `--main-only` | Save 1 main track only (tries langs in order, stops at first hit) |
 | `--list URL` | DB-backed video list with status marks, no API calls (scan first) |
 | `--missing URL` | Download missing-subtitles only (requires `--yes`) |
 | `--retry-failed [SEL]` | Retry failed jobs (`all`, `1,3`, `2-5`) |
@@ -68,6 +71,7 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 ```powershell
 python $py --channel "https://www.youtube.com/@handle" --type both --date ">= 2024-01-01" --json
 python $py --single "URL1" "URL2" --langs ko --out "D:\subs"
+python $py --file "urls.xlsx" --langs ko,en --main-only --format srt --out "D:\subs" --json
 python $py --missing "https://www.youtube.com/@handle" --order desc --select "1-10" --yes --json
 python $py --retry-failed --json
 python $py --scan "https://www.youtube.com/@handle" --scan-type both
@@ -83,6 +87,8 @@ python $py --scan "https://www.youtube.com/@handle" --scan-type both
 ## Limits
 
 - Private/member-only videos need a logged-in browser cookie; failures say why.
+- Cookie auto-extract tries chrome → brave → edge → firefox (Default profile, browser fully closed). Modern Chrome may fail always (app-bound encryption) → manual `cookies.txt` in download dir.
+- `--file` xlsx needs `pip install openpyxl`; non-video lines (channels, playlists, text) are counted as skipped, not errors.
 - Listings carry no upload dates (YouTube API limit) — date filters apply at download time.
 - Playlist items are classified long/shorts by URL and duration heuristic; channel tabs are exact.
 - SRT headers use `#` comments most players ignore; strict players may warn.
