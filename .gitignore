@@ -56,3 +56,6 @@ desktop.ini
 # 로컬 전용 (URL 목록·개인 경로 포함, 커밋 제외)
 input/
 resume_playlist.ps1
+
+# opencode session dumps (토큰/비밀값 포함 가능, 대용량 - 커밋 제외)
+app_*.json
