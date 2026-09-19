@@ -20,7 +20,8 @@
 > 재시도는 실패 당시 설정 그대로 재현. 회귀 테스트: `python -m unittest tests.test_subtitle_defaults`
 >
 > 대시보드(`--dashboard`, `Downloads\dashboard.html`): 최근 실행·로그별 시도 영상
-> (제목·URL·상태) 목록 + 새로고침 버튼. 로그파일↔실행은 `runs.log_file`로 확정 연결.
+> (제목·URL·상태) 목록 + 현재 진행중(제목·URL·경과) + 최근 로그 15줄 + 새로고침 버튼.
+> 배치 중 매 영상마다 갱신, 15초 자동새로고침. 로그파일↔실행은 `runs.log_file`로 확정 연결.
 
 # YouTube Downloader (yt-dlp 20분 분할)
 

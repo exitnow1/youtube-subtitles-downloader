@@ -414,6 +414,20 @@ def db_run_items(conn: sqlite3.Connection, run: dict, limit: int = 200):
     return [dict(r) for r in rows]
 
 
+def db_running_now(conn: sqlite3.Connection, stale_minutes: int = 30):
+    """지금 시도 중인 목록 (running + 시작이 오래되지 않음, 오래된 좀비 제외).
+
+    started_at ISO 문자열 비교. 반환: url/title/video_id/mode/started_at (id순).
+    """
+    cutoff = (datetime.now() - timedelta(minutes=stale_minutes)).isoformat(timespec="seconds")
+    rows = conn.execute(
+        """SELECT url, title, video_id, mode, started_at FROM downloads
+            WHERE status = 'running' AND started_at >= ? ORDER BY id""",
+        (cutoff,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def db_channel_overview(conn: sqlite3.Connection, target_url: str):
     """채널/재생목록 한 곳의 현황: 최신 스캔 항목 + 자막 상태 + 개수.
 

@@ -50,7 +50,7 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 | `--missing URL` | Download missing-subtitles only (requires `--yes`) |
 | `--retry-failed [SEL]` | Retry failed jobs (`all`, `1,3`, `2-5`) |
 | `--scan URL` | Snapshot listing only, no downloads |
-| `--dashboard` | (Re)build `dashboard.html` (per-run/log video lists + refresh button) |
+| `--dashboard` | (Re)build `dashboard.html` (live progress, per-run/log videos, log tail, auto-refresh) |
 | `--type long\|shorts\|both` | Video kind filter (default long) |
 | `--langs ko,en\|all` | Subtitle languages (default ko,en; default policy: 1 auto track, ko→en first hit) |
 | `--no-auto` | Manual subs only (implies manual include) |

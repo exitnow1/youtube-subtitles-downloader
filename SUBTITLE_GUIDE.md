@@ -30,7 +30,7 @@ Youtube downloader/
 | `Downloads/subtitle_download.log` | 실행 로그 |
 | `Downloads/.last_subtitle_dir` | 지난번 저장 폴더 기억 |
 | `Downloads/SUB_FAIL_LIST_시간.txt` | 그날의 실패 목록 |
-| `Downloads/dashboard.html` | 대시보드 (모드 7 또는 `--dashboard`, 브라우저로 열기) |
+| `Downloads/dashboard.html` | 대시보드 (모드 7 또는 `--dashboard`, 브라우저로 열기. 현재 진행중·최근 실행/로그별 영상·15초 자동새로고침. 배치 중 매 영상마다 갱신) |
 
 ## 2. 시작하면 일어나는 일 (순서대로)
 

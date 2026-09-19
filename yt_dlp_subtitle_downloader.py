@@ -44,7 +44,7 @@ from subtitle_db import (
     db_cleanup_stale_running, normalize_scan_target, db_record_scan,
     db_latest_scan, db_scan_history, db_missing_subs, db_dashboard_data,
     db_success_count, db_channel_overview, db_run_start, db_run_finish,
-    db_recent_runs, db_run_items,
+    db_recent_runs, db_run_items, db_running_now,
 )
 
 # Windows 콘솔(cp949)에서 한글 자모 등이 인코딩 안 되어 print()가 죽는 것을 방지
@@ -239,7 +239,7 @@ def log(msg: str, to_file: bool = True):
 
 
 RUN_LOG_FILE = None  # P5-7: 이번 실행 전용 로그 (main에서 설정)
-DASHBOARD_EVERY_N = 10  # P5-7: N개 처리마다 대시보드 실시간 갱신
+DASHBOARD_EVERY_N = 1  # 매 영상 처리마다 대시보드 실시간 갱신 (로컬 HTML 쓰기라 비용 없음)
 
 
 def _counters():
@@ -1846,24 +1846,46 @@ def status_badge(dl_status):
     return ("없음", "#cf222e")
 
 
-def build_dashboard_html(targets, generated_at: str, runs=None, logfiles=None) -> str:
-    """대시보드 HTML 한 장 (인라인 CSS + 제목/상태 필터 JS)."""
+def build_dashboard_html(targets, generated_at: str, runs=None, logfiles=None,
+                         progress=None, logtail=None) -> str:
+    """대시보드 HTML 한 장 (인라인 CSS + 제목/상태 필터 JS + 15초 자동새로고침)."""
     total_videos = sum(len(t["items"]) for t in targets)
     total_with = sum(1 for t in targets for it in t["items"] if it.get("dl_status") == "success")
     parts = []
     parts.append("<!DOCTYPE html><html lang=\"ko\"><head><meta charset=\"utf-8\">"
+                 "<meta http-equiv=\"refresh\" content=\"15\">"
                  "<title>자막 대시보드</title><style>"
                  "body{font-family:sans-serif;max-width:1100px;margin:24px auto;padding:0 16px}"
                  "table{border-collapse:collapse;width:100%;margin:12px 0}"
                  "th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;font-size:14px}"
                  "th{background:#f0f0f0}.badge{color:#fff;border-radius:10px;padding:2px 10px;font-size:12px}"
                  ".card{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:16px 0}"
-                 ".controls{margin:12px 0}</style></head><body>")
+                 ".controls{margin:12px 0}pre{background:#f6f8fa;padding:8px;overflow:auto;font-size:12px}</style></head><body>")
     parts.append(f"<h1>자막 대시보드</h1><p>생성: {html.escape(generated_at)} | "
                  f"대상 {len(targets)}곳 | 영상 {total_videos}개 | 자막있음 {total_with}개</p>"
                  "<p><button onclick=\"location.reload()\">새로고침</button> "
                  "최신 데이터는 앱에서 스캔·다운로드 후 자동 갱신됩니다 "
-                 "(수동 재생성: <code>--dashboard</code>)</p>")
+                 "(수동 재생성: <code>--dashboard</code>, 이 페이지는 15초마다 자동 새로고침)</p>")
+    parts.append("<div class=\"card\"><h2>현재 진행 중</h2>")
+    if progress:
+        parts.append("<table><tr><th>제목</th><th>URL</th><th>모드</th><th>시작</th><th>경과</th></tr>")
+        for p in progress:
+            title = html.escape(str(p.get("title") or p.get("video_id") or "?"), quote=True)
+            url = html.escape(str(p.get("url") or ""), quote=True)
+            link = f"<a href=\"{url}\">{title}</a>" if url else title
+            el = p.get("elapsed_sec", 0)
+            el_s = f"{el // 60}분 {el % 60}초" if el >= 60 else f"{el}초"
+            parts.append(
+                f"<tr><td>{link}</td><td>{url}</td>"
+                f"<td>{html.escape(str(p.get('mode', '')))}</td>"
+                f"<td>{html.escape(str(p.get('started_at', '')))}</td><td>{el_s}</td></tr>")
+        parts.append("</table>")
+    else:
+        parts.append("<p>진행 중인 작업 없음</p>")
+    parts.append("</div>")
+    if logtail:
+        parts.append("<div class=\"card\"><h2>최근 로그</h2><pre>"
+                     + html.escape("\n".join(logtail)) + "</pre></div>")
     parts.append("<div class=\"controls\"><input id=\"q\" placeholder=\"제목 검색...\"> "
                  "<select id=\"st\"><option value=\"\">전체 상태</option>"
                  "<option>있음</option><option>없음</option><option>실패</option>"
@@ -1989,8 +2011,19 @@ def _fmt_items_cell(items, limit: int = 3) -> str:
     return "<br>".join(parts)
 
 
+def read_log_tail(path=None, n: int = 15):
+    """로그 끝 n줄 (이번 실행 로그 우선, 없으면 전체 로그). 실패 시 빈 목록."""
+    cand = path or (RUN_LOG_FILE if RUN_LOG_FILE and os.path.exists(RUN_LOG_FILE) else LOG_FILE)
+    try:
+        with open(cand, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        return [ln for ln in lines[-n:] if ln.strip()]
+    except Exception:
+        return []
+
+
 def write_dashboard(db_conn, path=None) -> str:
-    """DB → dashboard.html 생성 (최근 실행+시도 영상, 로그별 영상 포함). 반환: 저장 경로."""
+    """DB → dashboard.html 생성 (진행중·최근 실행+시도 영상, 로그별 영상 포함). 반환: 저장 경로."""
     if path is None:
         ensure_dirs()
         path = os.path.join(DOWNLOAD_DIR, "dashboard.html")
@@ -2005,6 +2038,18 @@ def write_dashboard(db_conn, path=None) -> str:
         except Exception as e:
             log(f"[경고] 실행 영상 조회 실패: {e}", to_file=False)
             r["items"] = []
+    try:
+        progress = db_running_now(db_conn, STALE_RUNNING_MINUTES)
+        now = datetime.now()
+        for p in progress:
+            try:
+                p["elapsed_sec"] = max(
+                    0, int((now - datetime.fromisoformat(p.get("started_at", ""))).total_seconds()))
+            except (TypeError, ValueError):
+                p["elapsed_sec"] = 0
+    except Exception as e:
+        log(f"[경고] 진행중 조회 실패: {e}", to_file=False)
+        progress = []
     logs = []
     try:
         for name, size_kb, mtime, epoch in list_run_logs():
@@ -2015,7 +2060,8 @@ def write_dashboard(db_conn, path=None) -> str:
         log(f"[경고] 로그 목록 조회 실패: {e}", to_file=False)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(build_dashboard_html(data, generated, runs, logs))
+        f.write(build_dashboard_html(data, generated, runs, logs,
+                                     progress=progress, logtail=read_log_tail()))
     log(f"대시보드 생성 → {path} (대상 {len(data)}곳)")
     return path
 
