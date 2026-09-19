@@ -16,6 +16,10 @@
 차단에 훨씬 안전합니다. 그래도 player API 단계에서 429를 맞을 수 있어
 요청 간 휴식(sleep/jitter)과 429 백오프, 쿠키 재사용 패턴을 유지합니다.
 
+기본값: 자동자막만 + 메인 1트랙 (ko 자동 → en 자동 순서로 단일 라운드씩 시도,
+첫 성공에서 중단 → 파일 최대 1개). 수동 자막 포함은 --with-manual,
+언어별 전 트랙 저장은 --no-main-only 로 복원합니다.
+
 필요 패키지: pip install yt-dlp browser_cookie3
 """
 
@@ -475,11 +479,17 @@ class SubtitleFilter:
 
 # =============== yt-dlp 래퍼 (자막 전용) ===============
 
-def make_sub_ydl(outtmpl: str, langs, auto_subs: bool, sub_format: str, match_filter=None):
-    """자막 전용 yt-dlp 옵션. skip_download=True라 영상 파일은 절대 받지 않음."""
+def make_sub_ydl(outtmpl: str, langs, auto_subs: bool, sub_format: str, match_filter=None,
+                  manual_subs: bool | None = None):
+    """자막 전용 yt-dlp 옵션. skip_download=True라 영상 파일은 절대 받지 않음.
+
+    manual_subs가 None이면 INCLUDE_MANUAL 전역(기본 False=자동만)을 따름.
+    """
+    if manual_subs is None:
+        manual_subs = INCLUDE_MANUAL
     ydl_opts = {
         "skip_download": True,          # 영상 본체는 받지 않음 (핵심)
-        "writesubtitles": True,         # 수동 자막 저장
+        "writesubtitles": bool(manual_subs),  # 수동 자막 저장 (기본 제외)
         "writeautomaticsub": auto_subs,  # 자동생성 자막 저장 여부
         "subtitleslangs": langs,        # 예: ['ko', 'en'] 또는 ['all']
         "subtitlesformat": sub_format,  # 예: 'vtt/best', 'srt/vtt/best'
@@ -825,7 +835,8 @@ def _db_fail_once(db_conn, url, title, mode, langs, auto_subs, sub_format, reaso
         return
     try:
         job_id = db_record_start(db_conn, url, title, mode, langs, auto_subs, sub_format, encoding,
-                                 video_type, video_id)
+                                 video_type, video_id,
+                                 manual_subs=INCLUDE_MANUAL, main_only=MAIN_ONLY)
         db_record_finish(db_conn, job_id, "failed", reason, title, "", video_id)
     except Exception as e:
         log(f"[경고] DB 실패 기록 실패: {e}")
@@ -992,7 +1003,8 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             job_id = db_record_start(db_conn, url, started_title, mode, langs, auto_subs, sub_format,
                                      normalize_encoding(encoding),
                                      entry_video_type or "long",
-                                     entry_video_id or parse_video_id_from_url(url) or "")
+                                     entry_video_id or parse_video_id_from_url(url) or "",
+                                     manual_subs=INCLUDE_MANUAL, main_only=MAIN_ONLY)
         except Exception as e:
             log(f"[경고] DB 시작 기록 실패: {e}")
             job_id = None
@@ -1026,6 +1038,12 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             _db_finish(db_conn, job_id, "failed", reason, real_title, "", _final_vid())
             return "failed", False
         if fatal == "error":
+            if saw_429 and pending:
+                # 429 소진: IP가 달아오른 상태라 이 후보는 막힘 → 다음 후보로 통과.
+                # (신규 기본 ko우선에서 ko번역 트랙만 막힌 경우 en으로 계속)
+                # 영상 간 차단기는 호출부의 consec_429가 담당.
+                log(f"[폴백] '{round_label}' 429 소진 → 다음 후보 시도", to_file=False)
+                continue
             log(f"[END] 자막 실패: {real_title} / {fatal_msg}")
             FAIL_LIST.append({"title": real_title, "url": url})
             _db_finish(db_conn, job_id, "failed", str(fatal_msg)[:500], real_title, "", _final_vid())
@@ -1533,14 +1551,22 @@ def _execute_retry_targets(db_conn, targets):
         sub_mode = row["mode"] if row["mode"] in ("playlist", "channel", "single") else "single"
         log(f"[START] 재시도 {n}/{len(targets)} (통산 {row['attempt_no'] + 1}회차): {row['title']}")
         sub_filter = SubtitleFilter()  # 조건 없음
+        # 실패 당시 트랙 정책 그대로 재현 (옛 기록은 수동포함·전트랙 기본값으로 읽힘)
+        _prev_manual, _prev_main = INCLUDE_MANUAL, MAIN_ONLY
+        _set_sub_track_policy(
+            manual=bool(row.get("manual_subs", 1)),
+            main_only=bool(row.get("main_only", 0)))
         try:
             result, saw_429 = download_subs_for_video(
                 url, sub_mode, sub_filter, langs, auto_subs, sub_format,
                 title_hint=row["title"], db_conn=db_conn, encoding=encoding,
                 entry_video_id=parse_video_id_from_url(url), entry_video_type=row_vtype)
         except KeyboardInterrupt:
+            _set_sub_track_policy(manual=_prev_manual, main_only=_prev_main)
             log("[중단] 재시도 중단 (남은 항목은 DB에 보관됨)")
             break
+        finally:
+            _set_sub_track_policy(manual=_prev_manual, main_only=_prev_main)
         log(f"[END] 재시도 {n}/{len(targets)}: {result}")
         done_retry += 1
         consec_429 = consec_429 + 1 if saw_429 else 0
@@ -2291,13 +2317,20 @@ def parse_range_filter(raw):
 
 
 def ask_lang_config():
-    """자막 언어/자동자막/형식/인코딩 묻기."""
+    """자막 언어/자동자막/수동포함/메인1개/형식/인코딩 묻기 (기본: 자동만+1개)."""
     langs = parse_langs(input("자막 언어 (쉼표 구분, 예: ko,en / 전체는 all, Enter=ko,en): "))
     auto_subs = parse_auto(input("자동생성 자막도 포함? (Y/n, Enter=Y): "))
+    manual = input("수동 자막도 포함? (y/N, Enter=N=자동만): ").strip().lower() == "y"
+    main_only = input("메인 1개만 저장? (Y/n, Enter=Y): ").strip().lower() != "n"
+    if not auto_subs:  # 수동만 모드면 수동이 필요
+        manual = True
+    _set_sub_track_policy(manual=manual, main_only=main_only)
     sub_format = parse_sub_format(input("형식 (vtt/srt, Enter=vtt): "))
     enc_raw = input("인코딩 (Enter=UTF-8 / bom=한글TV용 / cp949=구형기기용): ").strip()
     encoding = normalize_encoding(enc_raw)
-    log(f"자막 설정: 언어={langs}, 자동자막={'포함' if auto_subs else '제외'}, 형식={sub_format}, 인코딩={encoding}")
+    log(f"자막 설정: 언어={langs}, 자동자막={'포함' if auto_subs else '제외'}, "
+        f"수동자막={'포함' if manual else '제외'}, {'메인1개' if main_only else '전트랙'}, "
+        f"형식={sub_format}, 인코딩={encoding}")
     return langs, auto_subs, sub_format, encoding
 
 
@@ -2381,9 +2414,13 @@ def parse_cli(argv=None):
     p.add_argument("--missing", default=None, help="미수신만 받기 (URL)")
     p.add_argument("--type", default="", help="long|shorts|both (기본 long)")
     p.add_argument("--langs", default="", help="자막 언어 (예: ko,en / all, 기본 ko,en)")
-    p.add_argument("--no-auto", action="store_true", help="자동생성 자막 제외")
+    p.add_argument("--no-auto", action="store_true", help="자동생성 자막 제외 (수동만, 수동 자동 포함)")
+    p.add_argument("--with-manual", action="store_true",
+                   help="수동 자막도 포함 (기본은 자동만)")
     p.add_argument("--main-only", action="store_true",
-                   help="메인 자막 1개만 저장 (요청 언어 순서대로 단일 트랙씩 시도, 첫 성공에서 중단)")
+                   help="메인 자막 1개만 저장 (기본 동작, 호환용)")
+    p.add_argument("--no-main-only", action="store_true",
+                   help="언어별 전 트랙 저장 (예전 기본 동작으로 복원)")
     p.add_argument("--format", default="", help="vtt|srt (기본 vtt)")
     p.add_argument("--encoding", default="", help="utf-8|bom|cp949 (기본 utf-8)")
     p.add_argument("--out", default="", help="저장 폴더 (기본값: 지난번/기본)")
@@ -2400,7 +2437,15 @@ def parse_cli(argv=None):
 
 
 JSON_MODE = False  # --json: 마지막에 SUMMARY_JSON 1줄 (에이전트용)
-MAIN_ONLY = False  # --main-only: 메인 자막 1개만 (단일 트랙 라운드, 첫 성공에서 중단)
+MAIN_ONLY = True  # 기본: 메인 자막 1개만 (단일 트랙 라운드, 첫 성공에서 중단)
+INCLUDE_MANUAL = False  # 기본: 수동 자막 제외 (자동만). --with-manual 로 포함
+
+
+def _set_sub_track_policy(manual: bool, main_only: bool):
+    """자막 트랙 정책 전역 설정 (CLI 공용·대화형·재시도 공용 진입점)."""
+    global INCLUDE_MANUAL, MAIN_ONLY
+    INCLUDE_MANUAL = bool(manual)
+    MAIN_ONLY = bool(main_only)
 
 
 def run_headless_flow(args):
@@ -2539,6 +2584,9 @@ def _cli_common(args):
     """
     langs = parse_langs(args.langs)
     auto_subs = not args.no_auto
+    # 수동 기본 제외. --no-auto(수동만)면 수동이 필요하므로 수동 포함.
+    _set_sub_track_policy(manual=bool(args.with_manual or args.no_auto),
+                          main_only=not bool(args.no_main_only))
     sub_format = parse_sub_format(args.format)
     encoding = normalize_encoding(args.encoding)
     vtype = parse_video_type(args.type)
@@ -2643,7 +2691,7 @@ def run_headless_retry(selection_raw="all"):
 
 
 def main():
-    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE, JSON_MODE, MAIN_ONLY
+    global SUBTITLE_DIR, HEADLESS, RUN_LOG_FILE, JSON_MODE
     apply_config(load_config())  # 설정 파일 우선 적용 (없으면 기본값으로 생성)
     # P5-7: 이번 실행 전용 로그 파일 (대시보드·트러블슈팅용)
     try:
@@ -2660,7 +2708,8 @@ def main():
                     or args.dashboard or args.channel or args.playlist or args.single
                     or args.list or args.missing or args.file)
     JSON_MODE = bool(args.json)
-    MAIN_ONLY = bool(args.main_only)
+    _set_sub_track_policy(manual=bool(args.with_manual or args.no_auto),
+                          main_only=not bool(args.no_main_only))
     if args.scan is not None:
         run_headless_scan(args.scan, args.scan_type or "long")
         return

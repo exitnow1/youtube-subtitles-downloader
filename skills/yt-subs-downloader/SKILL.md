@@ -9,6 +9,8 @@ description: "Use when downloading YouTube subtitles in bulk, checking channel u
 
 Batch-download YouTube subtitles (video files never fetched) with channel/playlist/single modes, scan snapshots, retry queue, scheduler integration, and SQLite-backed status tracking.
 
+Default subtitle policy: 1 auto-generated track only — tries ko auto, then en auto, stops at first hit (max 1 file, manual excluded). Opt out with `--with-manual` (include manual) and `--no-main-only` (all tracks per language).
+
 ## When to use
 
 - One or more video URLs → subtitle files
@@ -31,7 +33,7 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 
 ## Workflow
 
-1. **Parse the request**: URLs, mode, subtitle langs, filters (date/duration/range/type), output dir. Ask only if the target URL is absent.
+1. **Parse the request**: URLs, mode, subtitle langs, filters (date/duration/range/type), output dir. Ask only if the target URL is absent. Unless the user says otherwise, use defaults (1 auto track, ko→en) — pass `--langs` only to override, `--with-manual`/`--no-main-only` to restore old behavior.
 2. **Run the CLI** (never parallelize; one invocation at a time).
 3. **Read results** from stdout plus `SUMMARY_JSON:` (with `--json`): per-item outcomes and counts. Never silently drop failures — report them with reasons.
 4. **Report to the user**: saved count, skipped/cached counts, failures with reasons, dashboard path.
@@ -44,15 +46,17 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 | `--playlist URL` | Playlist subtitles |
 | `--single URL [URL...]` | One or more individual videos |
 | `--file PATH` | URL batch from txt/md/csv/xlsx (video URLs only; runs recorded as `file`) |
-| `--main-only` | Save 1 main track only (tries langs in order, stops at first hit) |
 | `--list URL` | DB-backed video list with status marks, no API calls (scan first) |
 | `--missing URL` | Download missing-subtitles only (requires `--yes`) |
 | `--retry-failed [SEL]` | Retry failed jobs (`all`, `1,3`, `2-5`) |
 | `--scan URL` | Snapshot listing only, no downloads |
 | `--dashboard` | (Re)build `dashboard.html` |
 | `--type long\|shorts\|both` | Video kind filter (default long) |
-| `--langs ko,en\|all` | Subtitle languages (default ko,en) |
-| `--no-auto` | Exclude auto-generated captions |
+| `--langs ko,en\|all` | Subtitle languages (default ko,en; default policy: 1 auto track, ko→en first hit) |
+| `--no-auto` | Manual subs only (implies manual include) |
+| `--with-manual` | Include manual subs (default: auto only) |
+| `--main-only` | 1 track only (default ON, compat flag) |
+| `--no-main-only` | All tracks per language (old default behavior) |
 | `--format vtt\|srt` | Subtitle format (default vtt) |
 | `--encoding utf-8\|bom\|cp949` | File encoding (default utf-8) |
 | `--out DIR` | Output folder override |
@@ -70,7 +74,8 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 
 ```powershell
 python $py --channel "https://www.youtube.com/@handle" --type both --date ">= 2024-01-01" --json
-python $py --single "URL1" "URL2" --langs ko --out "D:\subs"
+python $py --single "URL1" "URL2" --json   # defaults: 1 auto track (ko->en)
+python $py --single "URL1" "URL2" --langs ko --with-manual --no-main-only --out "D:\subs"
 python $py --file "urls.xlsx" --langs ko,en --main-only --format srt --out "D:\subs" --json
 python $py --missing "https://www.youtube.com/@handle" --order desc --select "1-10" --yes --json
 python $py --retry-failed --json

@@ -9,7 +9,9 @@ downloads 테이블 컬럼:
   title         영상 제목 (시작 시엔 목록 제목/URL, 완료 시 실제 제목으로 갱신)
   mode          channel / playlist / single / retry
   langs         'ko,en' 형태
-  auto_subs     1/0
+  auto_subs     1/0 (자동생성 포함 여부)
+  manual_subs   1/0 (수동 자막 포함 여부, 기본 0=자동만)
+  main_only     1/0 (메인 1트랙만, 기본 1)
   sub_format    'vtt/best' 등
   encoding      'utf-8' / 'utf-8-sig' / 'cp949'
   video_type    'long' / 'shorts' (수집 탭·URL·길이로 판별)
@@ -100,8 +102,10 @@ def db_init(path: str) -> sqlite3.Connection:
     # P2-4: 옛 DB에도 encoding 컬럼 추가 (이미 있으면 무시)
     # P5-1: video_type(long/shorts), video_id 컬럼 추가 (이미 있으면 무시)
     for _col in ("encoding TEXT DEFAULT 'utf-8'",
-                 "video_type TEXT DEFAULT 'long'",
-                 "video_id TEXT DEFAULT ''"):
+                  "video_type TEXT DEFAULT 'long'",
+                  "video_id TEXT DEFAULT ''",
+                  "manual_subs INTEGER DEFAULT 1",
+                  "main_only INTEGER DEFAULT 0"):
         try:
             conn.execute(f"ALTER TABLE downloads ADD COLUMN {_col}")
             conn.commit()
@@ -121,16 +125,18 @@ def db_next_attempt_no(conn: sqlite3.Connection, url: str) -> int:
 
 def db_record_start(conn: sqlite3.Connection, url: str, title: str, mode: str,
                     langs, auto_subs: bool, sub_format: str, encoding: str = "utf-8",
-                    video_type: str = "long", video_id: str = "") -> int:
+                    video_type: str = "long", video_id: str = "",
+                    manual_subs: bool = True, main_only: bool = False) -> int:
     """시도 시작 기록 → 행 id 반환. 비정상 종료 시 status='running'으로 남음."""
     langs_str = ",".join(langs) if isinstance(langs, (list, tuple)) else str(langs)
     cur = conn.execute(
         """INSERT INTO downloads
            (url, title, mode, langs, auto_subs, sub_format, encoding, video_type, video_id,
-            status, attempt_no, started_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
+            manual_subs, main_only, status, attempt_no, started_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
         (url, title, mode, langs_str, 1 if auto_subs else 0, sub_format, encoding or "utf-8",
          video_type or "long", video_id or "",
+         1 if manual_subs else 0, 1 if main_only else 0,
          db_next_attempt_no(conn, url), now_iso()),
     )
     conn.commit()

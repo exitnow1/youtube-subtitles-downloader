@@ -14,6 +14,10 @@
 > 스킬 설치: 이 저장소의 `skills/yt-subs-downloader/` 폴더를
 > `C:\Users\rpt53\.agents\skills\` 아래에 복사하면 opencode·Codex가 자동 인식합니다
 > (이 저장소에도 함께 커밋되어 있음).
+>
+> 자막 기본값(2026-09-19~): **자동자막 1개만** — ko 자동 → en 자동 순서로 첫 성공에서
+> 중단, 수동 제외. 옛 동작(수동 포함·전 트랙)은 `--with-manual --no-main-only`.
+> 재시도는 실패 당시 설정 그대로 재현. 회귀 테스트: `python -m unittest tests.test_subtitle_defaults`
 
 # YouTube Downloader (yt-dlp 20분 분할)
 
