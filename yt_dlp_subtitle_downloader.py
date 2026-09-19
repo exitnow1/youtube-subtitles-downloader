@@ -44,7 +44,7 @@ from subtitle_db import (
     db_cleanup_stale_running, normalize_scan_target, db_record_scan,
     db_latest_scan, db_scan_history, db_missing_subs, db_dashboard_data,
     db_success_count, db_channel_overview, db_run_start, db_run_finish,
-    db_recent_runs,
+    db_recent_runs, db_run_items,
 )
 
 # Windows 콘솔(cp949)에서 한글 자모 등이 인코딩 안 되어 print()가 죽는 것을 방지
@@ -249,11 +249,12 @@ def _counters():
 
 
 def _run_begin(db_conn, kind, target):
-    """작업 시작 기록. 반환: runs id (실패 시 None)."""
+    """작업 시작 기록. 반환: runs id (실패 시 None). 실행 로그파일명도 함께 남김."""
     if db_conn is None:
         return None
     try:
-        return db_run_start(db_conn, kind, target)
+        log_name = os.path.basename(RUN_LOG_FILE) if RUN_LOG_FILE else ""
+        return db_run_start(db_conn, kind, target, log_file=log_name)
     except Exception as e:
         log(f"[경고] 작업 시작 기록 실패: {e}")
         return None
@@ -1859,7 +1860,10 @@ def build_dashboard_html(targets, generated_at: str, runs=None, logfiles=None) -
                  ".card{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:16px 0}"
                  ".controls{margin:12px 0}</style></head><body>")
     parts.append(f"<h1>자막 대시보드</h1><p>생성: {html.escape(generated_at)} | "
-                 f"대상 {len(targets)}곳 | 영상 {total_videos}개 | 자막있음 {total_with}개</p>")
+                 f"대상 {len(targets)}곳 | 영상 {total_videos}개 | 자막있음 {total_with}개</p>"
+                 "<p><button onclick=\"location.reload()\">새로고침</button> "
+                 "최신 데이터는 앱에서 스캔·다운로드 후 자동 갱신됩니다 "
+                 "(수동 재생성: <code>--dashboard</code>)</p>")
     parts.append("<div class=\"controls\"><input id=\"q\" placeholder=\"제목 검색...\"> "
                  "<select id=\"st\"><option value=\"\">전체 상태</option>"
                  "<option>있음</option><option>없음</option><option>실패</option>"
@@ -1867,7 +1871,7 @@ def build_dashboard_html(targets, generated_at: str, runs=None, logfiles=None) -
     if runs:
         parts.append("<div class=\"card\"><h2>최근 실행</h2>"
                      "<table><tr><th>종류</th><th>대상</th><th>시작</th><th>소요</th>"
-                     "<th>전체</th><th>성공</th><th>실패</th><th>비고</th></tr>")
+                     "<th>전체</th><th>성공</th><th>실패</th><th>영상</th><th>비고</th></tr>")
         for r in runs:
             dur = fmt_run_duration(r.get("started_at", ""), r.get("finished_at", ""))
             parts.append(
@@ -1877,14 +1881,17 @@ def build_dashboard_html(targets, generated_at: str, runs=None, logfiles=None) -
                 f"<td>{html.escape(dur)}</td>"
                 f"<td>{r.get('total', 0)}</td><td>{r.get('success', 0)}</td>"
                 f"<td>{r.get('failed', 0)}</td>"
+                f"<td>{_fmt_items_cell(r.get('items') or [])}</td>"
                 f"<td>{html.escape(str(r.get('note', ''))[:60])}</td></tr>")
         parts.append("</table></div>")
     if logfiles:
         parts.append("<div class=\"card\"><h2>최근 로그 파일</h2><table>"
-                     "<tr><th>파일</th><th>크기</th><th>수정시각</th></tr>")
-        for name, size_kb, mtime in logfiles:
-            parts.append(f"<tr><td>{html.escape(name)}</td><td>{size_kb}KB</td>"
-                         f"<td>{html.escape(mtime)}</td></tr>")
+                     "<tr><th>파일</th><th>크기</th><th>수정시각</th><th>영상</th></tr>")
+        for lf in logfiles:
+            parts.append(f"<tr><td>{html.escape(lf.get('name', ''))}</td>"
+                         f"<td>{lf.get('size_kb', 0)}KB</td>"
+                         f"<td>{html.escape(lf.get('mtime', ''))}</td>"
+                         f"<td>{_fmt_items_cell(lf.get('items') or [])}</td></tr>")
         parts.append("</table></div>")
     for t in targets:
         sc = t["scan"]
@@ -1941,13 +1948,49 @@ def list_run_logs(limit: int = 10):
             except OSError:
                 continue
         rows.sort(key=lambda r: r[3], reverse=True)
-        return [(n, s, m) for n, s, m, _ in rows[:limit]]
+        return [(n, s, m, e) for n, s, m, e in rows[:limit]]
     except Exception:
         return []
 
 
+def match_log_to_run(log_name: str, log_epoch: float, runs, window_sec: int = 300):
+    """로그파일 ↔ 실행 매칭. log_file 정확일치 우선, 옛 기록은 시작시각 근접(기본 5분)으로.
+
+    runs는 db_recent_runs dict 목록 (log_file/started_at 포함). 없으면 None.
+    """
+    for r in runs or []:
+        if (r.get("log_file") or "") == log_name:
+            return r
+    best, best_dt = None, None
+    for r in runs or []:
+        try:
+            got = (datetime.fromisoformat(r.get("started_at", "")) - datetime.fromtimestamp(log_epoch))
+            dt = abs(got.total_seconds())
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+        if dt <= window_sec and (best_dt is None or dt < best_dt):
+            best, best_dt = r, dt
+    return best
+
+
+def _fmt_items_cell(items, limit: int = 3) -> str:
+    """시도 영상 목록 셀 (제목 링크 + 상태, 최대 limit개 + 외 N건)."""
+    if not items:
+        return "-"
+    parts = []
+    for it in items[:limit]:
+        label, _ = status_badge(it.get("status"))
+        title = html.escape(str(it.get("title") or it.get("video_id") or "?"), quote=True)
+        url = html.escape(str(it.get("url") or ""), quote=True)
+        cell = f"<a href=\"{url}\">{title}</a> ({label})" if url else f"{title} ({label})"
+        parts.append(cell)
+    if len(items) > limit:
+        parts.append(f"외 {len(items) - limit}건")
+    return "<br>".join(parts)
+
+
 def write_dashboard(db_conn, path=None) -> str:
-    """DB → dashboard.html 생성 (최근 실행 + 로그 목록 포함). 반환: 저장 경로."""
+    """DB → dashboard.html 생성 (최근 실행+시도 영상, 로그별 영상 포함). 반환: 저장 경로."""
     if path is None:
         ensure_dirs()
         path = os.path.join(DOWNLOAD_DIR, "dashboard.html")
@@ -1956,9 +1999,23 @@ def write_dashboard(db_conn, path=None) -> str:
         runs = db_recent_runs(db_conn)
     except Exception:
         runs = []
+    for r in runs:
+        try:
+            r["items"] = db_run_items(db_conn, r)
+        except Exception as e:
+            log(f"[경고] 실행 영상 조회 실패: {e}", to_file=False)
+            r["items"] = []
+    logs = []
+    try:
+        for name, size_kb, mtime, epoch in list_run_logs():
+            m = match_log_to_run(name, epoch, runs)
+            logs.append({"name": name, "size_kb": size_kb, "mtime": mtime,
+                         "items": (m.get("items") or []) if m else []})
+    except Exception as e:
+        log(f"[경고] 로그 목록 조회 실패: {e}", to_file=False)
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(build_dashboard_html(data, generated, runs, list_run_logs()))
+        f.write(build_dashboard_html(data, generated, runs, logs))
     log(f"대시보드 생성 → {path} (대상 {len(data)}곳)")
     return path
 

@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT DEFAULT '',
   target TEXT DEFAULT '',
+  log_file TEXT DEFAULT '',
   started_at TEXT NOT NULL,
   finished_at TEXT DEFAULT '',
   total INTEGER DEFAULT 0,
@@ -111,6 +112,12 @@ def db_init(path: str) -> sqlite3.Connection:
             conn.commit()
         except sqlite3.OperationalError:
             pass  # duplicate column name → 이미 있음
+    # 옛 runs 테이블에도 log_file 컬럼 추가 (이미 있으면 무시)
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN log_file TEXT DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -360,11 +367,12 @@ def db_dashboard_data(conn: sqlite3.Connection):
     return out
 
 
-def db_run_start(conn: sqlite3.Connection, kind: str, target: str) -> int:
-    """작업 시작 기록 → runs id 반환."""
+def db_run_start(conn: sqlite3.Connection, kind: str, target: str,
+                 log_file: str = "") -> int:
+    """작업 시작 기록 → runs id 반환. log_file은 logs/run_*.log 파일명(대시보드 연결용)."""
     cur = conn.execute(
-        "INSERT INTO runs (kind, target, started_at) VALUES (?, ?, ?)",
-        (kind, target, now_iso()),
+        "INSERT INTO runs (kind, target, log_file, started_at) VALUES (?, ?, ?, ?)",
+        (kind, target, log_file or "", now_iso()),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -386,6 +394,23 @@ def db_recent_runs(conn: sqlite3.Connection, limit: int = 10):
     """최근 작업 목록 (최신순)."""
     rows = conn.execute(
         "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def db_run_items(conn: sqlite3.Connection, run: dict, limit: int = 200):
+    """한 실행 시간창에 시작된 시도 목록 (제목·URL·상태, id순).
+
+    started_at/finished_at은 ISO라 문자열 비교가 시간 비교와 같다.
+    미종료 실행(finished_at 없음)은 현재까지를 창 끝으로 본다.
+    """
+    start = run.get("started_at") or ""
+    end = run.get("finished_at") or now_iso()
+    rows = conn.execute(
+        """SELECT url, title, video_id, status, reason, started_at, finished_at
+            FROM downloads WHERE started_at >= ? AND started_at <= ?
+            ORDER BY id LIMIT ?""",
+        (start, end, limit),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
