@@ -36,7 +36,25 @@ Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_confi
 1. **Parse the request**: URLs, mode, subtitle langs, filters (date/duration/range/type), output dir. Ask only if the target URL is absent. Unless the user says otherwise, use defaults (1 auto track, ko→en) — pass `--langs` only to override, `--with-manual`/`--no-main-only` to restore old behavior.
 2. **Run the CLI** (never parallelize; one invocation at a time).
 3. **Read results** from stdout plus `SUMMARY_JSON:` (with `--json`): per-item outcomes and counts. Never silently drop failures — report them with reasons.
-4. **Report to the user**: saved count, skipped/cached counts, failures with reasons, dashboard path.
+4. **Report to the user**: ALWAYS in Korean, ALWAYS as a per-video table (see Report format). Never silently drop failures.
+
+## Report format (mandatory for every download run)
+
+One row per requested video, in request order:
+
+| # | 영상 (제목 + URL) | 결과 | 상세 | 재시도 예정 |
+|---|---|---|---|---|
+| 1 | 제목 `url` | 저장됨 | 파일명 (언어·크기) | - |
+| 2 | 제목 `url` | 실패 | 사유 (429/403/없음…) | 아래 규칙 |
+
+- 결과 값: `저장됨` / `이미 받아둠` / `자막 없음` / `조건 스킵` / `실패` (SUMMARY_JSON + stdout 근거).
+- 재시도 예정 규칙 (DB `finished_at` 기준):
+  - 429 → 실패시각 +30분 (또는 등록된 `YTSubsRetry_*` 예약 시각이 있으면 그 시각).
+  - 403 → 쿠키 갱신 후 (브라우저 완전 종료 후 재실행).
+  - 그 외 실패 → 즉시 가능.
+  - 없는 영상(삭제/비공개) → 재시도 없음.
+  - 성공·이미 받아둠·자막 없음·조건 스킵 → `-`.
+- 표 아래 한 줄: 저장 폴더, DB, 대시보드 경로.
 
 ## CLI reference
 
