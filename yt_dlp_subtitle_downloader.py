@@ -1076,8 +1076,15 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             for cand in _build_title_rest(tried, req_list, real_title):
                 pending.append(cand)
                 tried_labels.append(cand[2])
-    # 모든 후보 소진 → 자막 없음 확정 (실패가 아니라 별도 분류, 재시도 목록 제외)
+    # 모든 후보 소진 → 자막 없음 확정 (실패가 아니라 별도 분류, 재시도 목록 제외).
+    # 단 429를 맞은 적이 있으면 자막이 있어도 못 받은 것일 수 있어 실패로 기록 (재시도 가능).
     real_title = sub_filter.seen_title or started_title
+    if saw_429:
+        reason = f"429 후 후보 소진(자막 유무 불명, 나중에 재시도): {tried_str}"
+        log(f"[429미확정] {real_title} ({tried_str})")
+        FAIL_LIST.append({"title": real_title, "url": url})
+        _db_finish(db_conn, job_id, "failed", reason, real_title, "", _final_vid())
+        return "failed", True
     tried_str = " → ".join(tried_labels)
     reason = f"자막 없음(시도: {tried_str})"
     log(f"[자막 없음] {real_title} ({tried_str})")
