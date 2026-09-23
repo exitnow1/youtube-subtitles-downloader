@@ -29,7 +29,7 @@ $py = "$APP\yt_dlp_subtitle_downloader.py"
 python $py --help   # full flag list, always authoritative
 ```
 
-Requires `pip install yt-dlp browser_cookie3`. First run creates `subtitle_config.json` next to the script.
+Requires `pip install yt-dlp browser_cookie3 curl_cffi brotli` (curl_cffi = TLS impersonation, fewer blocks). Keep yt-dlp current (`pip install -U yt-dlp`). First run creates `subtitle_config.json` next to the script. For logged-in quota, place a `cookies.txt` in the download dir (auto-extract needs admin for Chrome) — anonymous IPs get throttled on subtitle files first.
 
 ## Workflow
 

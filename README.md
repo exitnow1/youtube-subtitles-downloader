@@ -19,6 +19,10 @@
 > 중단, 수동 제외. 옛 동작(수동 포함·전 트랙)은 `--with-manual --no-main-only`.
 > 재시도는 실패 당시 설정 그대로 재현. 회귀 테스트: `python -m unittest tests.test_subtitle_defaults`
 >
+> 429 대책(2026-09-23~): `pip install yt-dlp browser_cookie3 curl_cffi brotli` +
+> 로그인 쿠키(`Downloads\cookies.txt`). 429 연타 시 후보 전환 없이 조기 중단 후
+> 30분 뒤 재시도. yt-dlp는 최신 유지(`pip install -U yt-dlp`).
+>
 > 대시보드(`--dashboard`, `Downloads\dashboard.html`): 최근 실행·로그별 시도 영상
 > (제목·URL·상태) 목록 + 현재 진행중(제목·URL·경과) + 최근 로그 15줄 + 새로고침 버튼.
 > 배치 중 매 영상마다 갱신, 15초 자동새로고침. 로그파일↔실행은 `runs.log_file`로 확정 연결.

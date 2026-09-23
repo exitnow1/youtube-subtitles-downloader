@@ -344,10 +344,15 @@ def _try_load_browser_cookies():
 
 def export_cookies_from_chrome() -> bool:
     """임시 파일에 저장 성공 후에만 교체 (실패 시 기존 쿠키 유지)"""
+    global _COOKIE_EXPORT_OK
+    if _COOKIE_EXPORT_OK is False:
+        log("[안내] 쿠키 추출 생략 (이번 실행에서 이미 실패)", to_file=False)
+        return False
     log("[START] 쿠키 추출")
     cj = _try_load_browser_cookies()
     if cj is None:
         log("[경고] 쿠키 추출 실패 → 기존 cookies.txt 유지")
+        _COOKIE_EXPORT_OK = False
         return False
 
     tmp_path = COOKIE_PATH + ".tmp"
@@ -384,6 +389,7 @@ def export_cookies_from_chrome() -> bool:
         rotate_old_cookie()
         os.replace(tmp_path, COOKIE_PATH)
         log(f"[END] 새 쿠키 저장 → {COOKIE_PATH}")
+        _COOKIE_EXPORT_OK = True
         return True
     except Exception as e:
         log(f"[경고] 쿠키 교체 실패: {e}")
@@ -902,8 +908,12 @@ def _build_title_rest(tried, req_langs, title):
     return rest
 
 
-def _download_round(url, outtmpl, sub_filter, langs, auto_subs, sub_format, noplaylist, max_attempts):
+def _download_round(url, outtmpl, sub_filter, langs, auto_subs, sub_format, noplaylist, max_attempts,
+                    abort_on_429=False):
     """한 가지 (언어, 자동자막) 조합으로 최대 max_attempts회 시도.
+
+    abort_on_429=True면: 앞 후보에서 이미 429로 소진된 상태라 429 1회에 즉시 중단
+    (막힌 호스트 추가 타격 방지). 그 외 동작 동일.
 
     반환: (kept, saw_429, fatal, fatal_msg)
       kept=True  → 다운로드 정상 종료 (자막 파일 유무는 호출부가 확인)
@@ -932,6 +942,9 @@ def _download_round(url, outtmpl, sub_filter, langs, auto_subs, sub_format, nopl
                 return True, False, "gone", str(e)
             if "429" in msg or "too many requests" in msg:
                 saw_429 = True
+                if abort_on_429:
+                    log(f"[차단중] 429 지속 → 추가 대기 없이 중단: {e}", to_file=False)
+                    return True, True, "error", f"429 지속(앞 후보 소진): {e}"
                 wait = SLEEP_ON_429_BASE + random.uniform(10, 30)
                 log(f"[경고] 429 감지 (시도 {attempt}/{max_attempts}): {e} → {wait:.0f}초 대기")
                 time.sleep(wait)
@@ -1021,6 +1034,7 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
     tried = {(tuple(l), a) for l, a, _ in pending}
     tried_labels = [label for _, _, label in pending]
     round_no = 0
+    throttled = False  # 앞 후보가 429로 소진됐으면 이후 라운드는 429 1회에 즉시 중단
     while pending:
         round_langs, round_auto, round_label = pending.pop(0)
         round_no += 1
@@ -1028,7 +1042,7 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
             log(f"[폴백 {round_no}] {round_label}")
         kept, round_429, fatal, fatal_msg = _download_round(
             url, outtmpl, sub_filter, round_langs, round_auto, sub_format,
-            noplaylist, max_attempts)
+            noplaylist, max_attempts, abort_on_429=throttled)
         saw_429 = saw_429 or round_429
         real_title = sub_filter.seen_title or started_title
         if fatal == "gone":
@@ -1043,6 +1057,8 @@ def download_subs_for_video(url: str, mode: str, sub_filter: SubtitleFilter,
                 # 429 소진: IP가 달아오른 상태라 이 후보는 막힘 → 다음 후보로 통과.
                 # (신규 기본 ko우선에서 ko번역 트랙만 막힌 경우 en으로 계속)
                 # 영상 간 차단기는 호출부의 consec_429가 담당.
+                # 이후 라운드는 429 1회에 즉시 중단 (전체 차단이면 추가 타격 금지).
+                throttled = True
                 log(f"[폴백] '{round_label}' 429 소진 → 다음 후보 시도", to_file=False)
                 continue
             log(f"[END] 자막 실패: {real_title} / {fatal_msg}")
@@ -2549,6 +2565,7 @@ def parse_cli(argv=None):
 JSON_MODE = False  # --json: 마지막에 SUMMARY_JSON 1줄 (에이전트용)
 MAIN_ONLY = True  # 기본: 메인 자막 1개만 (단일 트랙 라운드, 첫 성공에서 중단)
 INCLUDE_MANUAL = False  # 기본: 수동 자막 제외 (자동만). --with-manual 로 포함
+_COOKIE_EXPORT_OK = None  # 이번 실행 쿠키 추출 상태 (실패 후 반복 시도 생략용)
 
 
 def _set_sub_track_policy(manual: bool, main_only: bool):
